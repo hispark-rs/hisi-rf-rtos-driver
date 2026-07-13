@@ -143,6 +143,12 @@ pub trait Runtime: Sync {
     /// Changes a live task's runtime-defined scheduling priority.
     fn set_task_priority(&self, task: TaskId, priority: u8) -> Result<(), Error>;
 
+    /// Prevents scheduler-driven preemption of the current task. Calls nest.
+    fn lock_scheduler(&self) -> Result<(), Error>;
+
+    /// Releases one scheduler-lock nesting level for the current task.
+    fn unlock_scheduler(&self) -> Result<(), Error>;
+
     /// Allocates a counting semaphore.
     fn semaphore_create(&self, initial: u32) -> Result<SemaphoreHandle, Error>;
 
@@ -212,6 +218,16 @@ pub fn current_task() -> Result<TaskId, Error> {
 /// Changes a task's scheduling priority through the installed runtime.
 pub fn set_task_priority(task: TaskId, priority: u8) -> Result<(), Error> {
     with_runtime(|runtime| runtime.set_task_priority(task, priority))
+}
+
+/// Prevents scheduler-driven preemption of the current task.
+pub fn lock_scheduler() -> Result<(), Error> {
+    with_runtime(|runtime| runtime.lock_scheduler())
+}
+
+/// Releases one scheduler-lock nesting level for the current task.
+pub fn unlock_scheduler() -> Result<(), Error> {
+    with_runtime(|runtime| runtime.unlock_scheduler())
 }
 
 /// Allocates a semaphore through the installed runtime.
@@ -371,6 +387,14 @@ mod tests {
             Ok(())
         }
 
+        fn lock_scheduler(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn unlock_scheduler(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
         fn semaphore_create(&self, _initial: u32) -> Result<SemaphoreHandle, Error> {
             Ok(unsafe { SemaphoreHandle::from_raw(NonZeroUsize::new(1).unwrap()) })
         }
@@ -417,6 +441,8 @@ mod tests {
         assert_eq!(id.into_raw(), 1);
         assert_eq!(current_task().unwrap().into_raw(), 7);
         set_task_priority(id, 2).unwrap();
+        lock_scheduler().unwrap();
+        unlock_scheduler().unwrap();
 
         static SEMAPHORE: Semaphore = Semaphore::new(1);
         SEMAPHORE.down().unwrap();
