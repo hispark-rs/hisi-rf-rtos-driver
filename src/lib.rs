@@ -73,6 +73,21 @@ pub enum WaitTimeout {
     Forever,
 }
 
+impl WaitTimeout {
+    /// Converts the vendor-compatible millisecond convention (`0` no-wait,
+    /// `u32::MAX` forever) into the typed contract.
+    pub const fn from_millis(milliseconds: u32) -> Self {
+        match milliseconds {
+            0 => Self::NoWait,
+            u32::MAX => Self::Forever,
+            value => {
+                // SAFETY: the two zero-like sentinel cases were handled above.
+                Self::Milliseconds(unsafe { NonZeroU32::new_unchecked(value) })
+            }
+        }
+    }
+}
+
 /// Result of a successful wait operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WaitOutcome {
