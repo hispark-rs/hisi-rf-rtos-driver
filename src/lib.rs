@@ -119,9 +119,11 @@ pub enum Error {
 /// Scheduler and synchronization capabilities consumed by a radio adapter.
 ///
 /// Implementations must never invoke user callbacks while holding a scheduler
-/// lock or with interrupts disabled. [`Runtime::semaphore_up`] must be bounded
-/// and callable from an interrupt; it may only record readiness and request a
-/// deferred schedule.
+/// lock or with interrupts disabled. [`Runtime::semaphore_up`] must be callable
+/// from an interrupt; in that context it may only record readiness and request
+/// a deferred schedule. Adapters bracket ISR dispatch with
+/// [`Runtime::interrupt_enter`] and [`Runtime::interrupt_exit`] so a backend can
+/// distinguish task-context wakeups from interrupt-context wakeups.
 pub trait Runtime: Sync {
     /// Spawns one task.
     fn spawn(
@@ -148,6 +150,16 @@ pub trait Runtime: Sync {
 
     /// Releases one scheduler-lock nesting level for the current task.
     fn unlock_scheduler(&self) -> Result<(), Error>;
+
+    /// Marks entry into an interrupt handler that may call runtime services.
+    fn interrupt_enter(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Marks exit from an interrupt handler that may call runtime services.
+    fn interrupt_exit(&self) -> Result<(), Error> {
+        Ok(())
+    }
 
     /// Allocates a counting semaphore.
     fn semaphore_create(&self, initial: u32) -> Result<SemaphoreHandle, Error>;
@@ -228,6 +240,16 @@ pub fn lock_scheduler() -> Result<(), Error> {
 /// Releases one scheduler-lock nesting level for the current task.
 pub fn unlock_scheduler() -> Result<(), Error> {
     with_runtime(|runtime| runtime.unlock_scheduler())
+}
+
+/// Marks entry into an interrupt handler through the installed runtime.
+pub fn interrupt_enter() -> Result<(), Error> {
+    with_runtime(|runtime| runtime.interrupt_enter())
+}
+
+/// Marks exit from an interrupt handler through the installed runtime.
+pub fn interrupt_exit() -> Result<(), Error> {
+    with_runtime(|runtime| runtime.interrupt_exit())
 }
 
 /// Allocates a semaphore through the installed runtime.
