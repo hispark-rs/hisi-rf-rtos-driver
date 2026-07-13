@@ -140,6 +140,9 @@ pub trait Runtime: Sync {
     /// Returns the current task identity.
     fn current_task(&self) -> Result<TaskId, Error>;
 
+    /// Changes a live task's runtime-defined scheduling priority.
+    fn set_task_priority(&self, task: TaskId, priority: u8) -> Result<(), Error>;
+
     /// Allocates a counting semaphore.
     fn semaphore_create(&self, initial: u32) -> Result<SemaphoreHandle, Error>;
 
@@ -204,6 +207,11 @@ pub fn sleep_ms(milliseconds: NonZeroU32) -> Result<(), Error> {
 /// Returns the current task identity.
 pub fn current_task() -> Result<TaskId, Error> {
     with_runtime(|runtime| runtime.current_task())
+}
+
+/// Changes a task's scheduling priority through the installed runtime.
+pub fn set_task_priority(task: TaskId, priority: u8) -> Result<(), Error> {
+    with_runtime(|runtime| runtime.set_task_priority(task, priority))
 }
 
 /// Allocates a semaphore through the installed runtime.
@@ -359,6 +367,10 @@ mod tests {
             Ok(TaskId::from_raw(7))
         }
 
+        fn set_task_priority(&self, _task: TaskId, _priority: u8) -> Result<(), Error> {
+            Ok(())
+        }
+
         fn semaphore_create(&self, _initial: u32) -> Result<SemaphoreHandle, Error> {
             Ok(unsafe { SemaphoreHandle::from_raw(NonZeroUsize::new(1).unwrap()) })
         }
@@ -404,6 +416,7 @@ mod tests {
         .unwrap();
         assert_eq!(id.into_raw(), 1);
         assert_eq!(current_task().unwrap().into_raw(), 7);
+        set_task_priority(id, 2).unwrap();
 
         static SEMAPHORE: Semaphore = Semaphore::new(1);
         SEMAPHORE.down().unwrap();
