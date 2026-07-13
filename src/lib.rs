@@ -218,6 +218,92 @@ pub unsafe fn semaphore_destroy(semaphore: SemaphoreHandle) -> Result<(), Error>
     with_runtime(|runtime| unsafe { runtime.semaphore_destroy(semaphore) })
 }
 
+/// Runtime-neutral counting semaphore suitable for static or embedded use.
+///
+/// The backend object is created lazily in normal context. Allocation happens
+/// outside the critical section; only publishing the opaque handle is atomic.
+/// Call [`Semaphore::try_init`] before an interrupt can first use the object.
+pub struct Semaphore {
+    initial: u32,
+    handle: Mutex<Cell<Option<SemaphoreHandle>>>,
+}
+
+// SAFETY: the only local mutable state is serialized by critical-section; the
+// installed Runtime owns and synchronizes the backend object.
+unsafe impl Sync for Semaphore {}
+
+impl Semaphore {
+    /// Creates an uninitialized semaphore descriptor.
+    pub const fn new(initial: u32) -> Self {
+        Self {
+            initial,
+            handle: Mutex::new(Cell::new(None)),
+        }
+    }
+
+    /// Ensures the backend semaphore exists and returns its opaque handle.
+    ///
+    /// This may allocate and therefore must not be called for the first time
+    /// from an interrupt or critical section.
+    pub fn try_init(&self) -> Result<SemaphoreHandle, Error> {
+        if let Some(handle) = critical_section::with(|cs| self.handle.borrow(cs).get()) {
+            return Ok(handle);
+        }
+
+        let candidate = semaphore_create(self.initial)?;
+        let selected = critical_section::with(|cs| {
+            let slot = self.handle.borrow(cs);
+            if let Some(handle) = slot.get() {
+                handle
+            } else {
+                slot.set(Some(candidate));
+                candidate
+            }
+        });
+
+        if selected != candidate {
+            // SAFETY: the candidate was never published and no other context
+            // can have observed it.
+            unsafe { semaphore_destroy(candidate)? };
+        }
+        Ok(selected)
+    }
+
+    /// Waits for one count.
+    pub fn down(&self) -> Result<(), Error> {
+        match semaphore_down(self.try_init()?, WaitTimeout::Forever)? {
+            WaitOutcome::Acquired => Ok(()),
+            WaitOutcome::TimedOut => Err(Error::TimedOut),
+        }
+    }
+
+    /// Waits for one count until `timeout` expires.
+    pub fn down_timeout(&self, timeout: WaitTimeout) -> Result<WaitOutcome, Error> {
+        semaphore_down(self.try_init()?, timeout)
+    }
+
+    /// Adds one count or wakes one waiter.
+    ///
+    /// Call [`try_init`](Self::try_init) in normal context before this method is
+    /// reachable from an interrupt.
+    pub fn up(&self) -> Result<(), Error> {
+        semaphore_up(self.try_init()?)
+    }
+
+    /// Destroys the backend semaphore.
+    ///
+    /// # Safety
+    ///
+    /// No task or interrupt may access this object during or after destruction.
+    pub unsafe fn destroy(&self) -> Result<(), Error> {
+        let handle = critical_section::with(|cs| self.handle.borrow(cs).take());
+        if let Some(handle) = handle {
+            unsafe { semaphore_destroy(handle) }?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -303,5 +389,13 @@ mod tests {
         .unwrap();
         assert_eq!(id.into_raw(), 1);
         assert_eq!(current_task().unwrap().into_raw(), 7);
+
+        static SEMAPHORE: Semaphore = Semaphore::new(1);
+        SEMAPHORE.down().unwrap();
+        SEMAPHORE.up().unwrap();
+        assert_eq!(
+            SEMAPHORE.down_timeout(WaitTimeout::NoWait).unwrap(),
+            WaitOutcome::Acquired
+        );
     }
 }

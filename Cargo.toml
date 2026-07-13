@@ -1,6 +1,6 @@
 [package]
 name = "hisi-rf-rtos-driver"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2024"
 description = "Runtime-neutral task and synchronization contract for HiSilicon radio firmware"
 license = "MIT"
@@ -11,4 +11,3 @@ categories = ["embedded", "no-std"]
 
 [dependencies]
 critical-section = "1"
-
