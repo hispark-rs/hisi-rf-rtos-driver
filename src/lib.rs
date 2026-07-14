@@ -52,6 +52,26 @@ impl SemaphoreHandle {
     }
 }
 
+/// Opaque recursive-mutex identity owned by the installed runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MutexHandle(NonZeroUsize);
+
+impl MutexHandle {
+    /// Creates a handle after a runtime allocated the corresponding object.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must uniquely identify a live mutex until destroy completes.
+    pub const unsafe fn from_raw(raw: NonZeroUsize) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the runtime-owned opaque value.
+    pub const fn into_raw(self) -> NonZeroUsize {
+        self.0
+    }
+}
+
 /// A task's scheduling parameters.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskConfig {
@@ -181,6 +201,23 @@ pub trait Runtime: Sync {
     /// The caller must prove that no task or interrupt can use `semaphore`
     /// during or after this call.
     unsafe fn semaphore_destroy(&self, semaphore: SemaphoreHandle) -> Result<(), Error>;
+
+    /// Allocates a recursive priority-inheritance mutex.
+    fn mutex_create(&self) -> Result<MutexHandle, Error>;
+
+    /// Acquires a mutex recursively or waits according to `timeout`.
+    fn mutex_lock(&self, mutex: MutexHandle, timeout: WaitTimeout) -> Result<WaitOutcome, Error>;
+
+    /// Releases one recursion level. Only the owning task may unlock.
+    fn mutex_unlock(&self, mutex: MutexHandle) -> Result<(), Error>;
+
+    /// Destroys a mutex.
+    ///
+    /// # Safety
+    ///
+    /// No owner, waiter, task, or interrupt may use `mutex` during or after
+    /// this call.
+    unsafe fn mutex_destroy(&self, mutex: MutexHandle) -> Result<(), Error>;
 }
 
 static RUNTIME: Mutex<Cell<Option<&'static dyn Runtime>>> = Mutex::new(Cell::new(None));
@@ -277,6 +314,30 @@ pub fn semaphore_up(semaphore: SemaphoreHandle) -> Result<(), Error> {
 /// See [`Runtime::semaphore_destroy`].
 pub unsafe fn semaphore_destroy(semaphore: SemaphoreHandle) -> Result<(), Error> {
     with_runtime(|runtime| unsafe { runtime.semaphore_destroy(semaphore) })
+}
+
+/// Allocates a recursive priority-inheritance mutex.
+pub fn mutex_create() -> Result<MutexHandle, Error> {
+    with_runtime(|runtime| runtime.mutex_create())
+}
+
+/// Acquires a mutex through the installed runtime.
+pub fn mutex_lock(mutex: MutexHandle, timeout: WaitTimeout) -> Result<WaitOutcome, Error> {
+    with_runtime(|runtime| runtime.mutex_lock(mutex, timeout))
+}
+
+/// Releases one mutex recursion level through the installed runtime.
+pub fn mutex_unlock(mutex: MutexHandle) -> Result<(), Error> {
+    with_runtime(|runtime| runtime.mutex_unlock(mutex))
+}
+
+/// Destroys a mutex through the installed runtime.
+///
+/// # Safety
+///
+/// See [`Runtime::mutex_destroy`].
+pub unsafe fn mutex_destroy(mutex: MutexHandle) -> Result<(), Error> {
+    with_runtime(|runtime| unsafe { runtime.mutex_destroy(mutex) })
 }
 
 /// Runtime-neutral counting semaphore suitable for static or embedded use.
@@ -436,6 +497,26 @@ mod tests {
         unsafe fn semaphore_destroy(&self, _semaphore: SemaphoreHandle) -> Result<(), Error> {
             Ok(())
         }
+
+        fn mutex_create(&self) -> Result<MutexHandle, Error> {
+            Ok(unsafe { MutexHandle::from_raw(NonZeroUsize::new(2).unwrap()) })
+        }
+
+        fn mutex_lock(
+            &self,
+            _mutex: MutexHandle,
+            _timeout: WaitTimeout,
+        ) -> Result<WaitOutcome, Error> {
+            Ok(WaitOutcome::Acquired)
+        }
+
+        fn mutex_unlock(&self, _mutex: MutexHandle) -> Result<(), Error> {
+            Ok(())
+        }
+
+        unsafe fn mutex_destroy(&self, _mutex: MutexHandle) -> Result<(), Error> {
+            Ok(())
+        }
     }
 
     static RUNTIME_A: TestRuntime = TestRuntime(AtomicU32::new(1));
@@ -473,5 +554,13 @@ mod tests {
             SEMAPHORE.down_timeout(WaitTimeout::NoWait).unwrap(),
             WaitOutcome::Acquired
         );
+
+        let mutex = mutex_create().unwrap();
+        assert_eq!(
+            mutex_lock(mutex, WaitTimeout::Forever).unwrap(),
+            WaitOutcome::Acquired
+        );
+        mutex_unlock(mutex).unwrap();
+        unsafe { mutex_destroy(mutex).unwrap() };
     }
 }
