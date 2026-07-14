@@ -12,3 +12,8 @@ The contract exposes small task, scheduler-lock, semaphore, and recursive-mutex
 capabilities. Priority inheritance belongs to the selected runtime; chip ABI
 adapters translate only the vendor symbols used by their pinned blob and do not
 turn this crate into a LiteOS compatibility surface.
+
+Task-table capacity is distinct from allocator/control-block exhaustion:
+`Runtime::spawn` returns `Error::NoTaskSlots` when no dynamic task slot remains,
+while `Error::ResourceExhausted` continues to describe stack, semaphore, mutex,
+or other bounded storage allocation failure.

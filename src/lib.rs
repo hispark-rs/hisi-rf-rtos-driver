@@ -126,6 +126,8 @@ pub enum Error {
     AlreadyInstalled,
     /// A task, semaphore, stack, or internal control block could not be allocated.
     ResourceExhausted,
+    /// The runtime has no dynamic task slot available for another task.
+    NoTaskSlots,
     /// The supplied opaque handle is no longer valid.
     InvalidHandle,
     /// The operation is not legal in the current execution context.
