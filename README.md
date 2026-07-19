@@ -19,6 +19,14 @@ priority semantics: `TaskPriority` accepts 0 through 31, with lower numeric
 values outranking higher values. A backend with the wrong major version or a
 missing capability is rejected before partial radio initialization.
 
+`conformance` is a separate, no-heap `Scenario -> Action -> Observation`
+harness for executing the same semantic checks against deterministic runtime
+backends. Reports carry a schema version, backend revision, capability bits and
+per-scenario status, and can be emitted as allocation-free JSON for CI. The
+initial suite covers priority/FIFO ordering and nested scheduler-lock deferral;
+synchronization, timeout, IRQ and task-lifecycle scenarios remain required
+before the v1 conformance suite is considered complete.
+
 Task-table capacity is distinct from allocator/control-block exhaustion:
 `Runtime::spawn` returns `Error::NoTaskSlots` when no dynamic task slot remains,
 while `Error::ResourceExhausted` continues to describe stack, semaphore, mutex,

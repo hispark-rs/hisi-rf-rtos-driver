@@ -7,6 +7,7 @@
 
 #![no_std]
 
+pub mod conformance;
 mod contract;
 
 use core::cell::Cell;
