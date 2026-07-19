@@ -48,6 +48,8 @@ pub enum ActorState {
     Running,
     /// Waiting for a resource or deadline.
     Blocked,
+    /// Waiting for a monotonic sleep deadline.
+    Sleeping,
     /// Task has exited and its identity is no longer live.
     Exited,
 }
@@ -100,6 +102,16 @@ pub enum Action {
     AdvanceTime {
         /// Milliseconds to advance.
         milliseconds: u32,
+    },
+    /// Block the current task until a monotonic deadline.
+    Sleep {
+        /// Non-zero sleep duration in milliseconds.
+        milliseconds: u32,
+    },
+    /// Observe one actor without changing scheduler state.
+    Observe {
+        /// Actor whose state is returned as the observation subject.
+        actor: ActorId,
     },
     /// Exit the current task.
     ExitTask,
@@ -164,6 +176,12 @@ pub enum ScenarioId {
     PriorityThenFifo,
     /// Nested scheduler locks defer preemption until the outermost unlock.
     NestedSchedulerLock,
+    /// Sleeping tasks become ready only at their monotonic deadline.
+    SleepDeadline,
+    /// A higher-priority ready task runs only after the outermost IRQ exits.
+    NestedInterruptExit,
+    /// Task exit switches away and permits later slot reuse.
+    TaskExitAndReuse,
 }
 
 impl ScenarioId {
@@ -172,6 +190,9 @@ impl ScenarioId {
         match self {
             Self::PriorityThenFifo => "priority_then_fifo",
             Self::NestedSchedulerLock => "nested_scheduler_lock",
+            Self::SleepDeadline => "sleep_deadline",
+            Self::NestedInterruptExit => "nested_interrupt_exit",
+            Self::TaskExitAndReuse => "task_exit_and_reuse",
         }
     }
 }
@@ -469,9 +490,189 @@ const NESTED_LOCK_STEPS: &[Step] = &[
     },
 ];
 
+const SLEEP_DEADLINE_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Cooperative,
+            main_priority: TaskPriority::LOWEST,
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::MAIN),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_A,
+            priority: TaskPriority::new(4).unwrap(),
+        },
+        expected: ExpectedObservation {
+            subject: Some((ActorId::WORKER_A, ActorState::Ready)),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::Yield,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            outcome: Some(ActionOutcome::ContextSwitched),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::Sleep { milliseconds: 5 },
+        expected: ExpectedObservation {
+            running: Some(ActorId::MAIN),
+            subject: Some((ActorId::WORKER_A, ActorState::Sleeping)),
+            outcome: Some(ActionOutcome::ContextSwitched),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::AdvanceTime { milliseconds: 4 },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Observe {
+            actor: ActorId::WORKER_A,
+        },
+        expected: ExpectedObservation {
+            subject: Some((ActorId::WORKER_A, ActorState::Sleeping)),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::AdvanceTime { milliseconds: 1 },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Observe {
+            actor: ActorId::WORKER_A,
+        },
+        expected: ExpectedObservation {
+            subject: Some((ActorId::WORKER_A, ActorState::Ready)),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::Yield,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            outcome: Some(ActionOutcome::ContextSwitched),
+            ..ANY
+        },
+    },
+];
+
+const NESTED_INTERRUPT_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Preemptive,
+            main_priority: TaskPriority::new(10).unwrap(),
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_A,
+            priority: TaskPriority::new(20).unwrap(),
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::MAIN),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::Yield,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::EnterInterrupt,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            interrupt_depth: Some(1),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::EnterInterrupt,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            interrupt_depth: Some(2),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::ExitInterrupt,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            interrupt_depth: Some(1),
+            outcome: Some(ActionOutcome::Completed),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::ExitInterrupt,
+        expected: ExpectedObservation {
+            running: Some(ActorId::MAIN),
+            subject: Some((ActorId::WORKER_A, ActorState::Ready)),
+            interrupt_depth: Some(0),
+            outcome: Some(ActionOutcome::ContextSwitched),
+            ..ANY
+        },
+    },
+];
+
+const TASK_EXIT_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Cooperative,
+            main_priority: TaskPriority::LOWEST,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_A,
+            priority: TaskPriority::new(4).unwrap(),
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Yield,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::ExitTask,
+        expected: ExpectedObservation {
+            running: Some(ActorId::MAIN),
+            subject: Some((ActorId::WORKER_A, ActorState::Exited)),
+            outcome: Some(ActionOutcome::ContextSwitched),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_A,
+            priority: TaskPriority::new(4).unwrap(),
+        },
+        expected: ExpectedObservation {
+            subject: Some((ActorId::WORKER_A, ActorState::Ready)),
+            outcome: Some(ActionOutcome::Spawned),
+            ..ANY
+        },
+    },
+];
+
 /// Initial shared scenarios. Additional synchronization, timeout, IRQ and task
 /// lifecycle scenarios must be added before A5R can be declared complete.
-pub const V1_SCENARIOS: [Scenario; 2] = [
+pub const V1_SCENARIOS: [Scenario; 5] = [
     Scenario {
         id: ScenarioId::PriorityThenFifo,
         steps: PRIORITY_FIFO_STEPS,
@@ -479,6 +680,18 @@ pub const V1_SCENARIOS: [Scenario; 2] = [
     Scenario {
         id: ScenarioId::NestedSchedulerLock,
         steps: NESTED_LOCK_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::SleepDeadline,
+        steps: SLEEP_DEADLINE_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::NestedInterruptExit,
+        steps: NESTED_INTERRUPT_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::TaskExitAndReuse,
+        steps: TASK_EXIT_STEPS,
     },
 ];
 
