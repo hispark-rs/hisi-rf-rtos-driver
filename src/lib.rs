@@ -17,7 +17,8 @@ use critical_section::Mutex;
 
 pub use contract::{
     InvalidTaskPriority, RuntimeCapabilities, RuntimeContract, RuntimeContractVersion,
-    TASK_PRIORITY_LEVELS, TaskPriority,
+    RuntimeExecutionModes, RuntimeExecutionProfile, RuntimeRequirements, TASK_PRIORITY_LEVELS,
+    TaskPriority,
 };
 
 /// Entry point used by a vendor-compatible task.
@@ -133,6 +134,8 @@ pub enum Error {
     AlreadyInstalled,
     /// The runtime's version or capabilities cannot satisfy contract v1.
     IncompatibleContract,
+    /// The installed scheduler cannot provide the required execution modes.
+    IncompatibleExecutionProfile,
     /// A task, semaphore, stack, or internal control block could not be allocated.
     ResourceExhausted,
     /// The runtime has no dynamic task slot available for another task.
@@ -158,6 +161,9 @@ pub enum Error {
 pub trait Runtime: Sync {
     /// Describes the versioned semantics implemented by this backend.
     fn contract(&self) -> RuntimeContract;
+
+    /// Describes scheduling modes backed by the installed target resources.
+    fn execution_profile(&self) -> RuntimeExecutionProfile;
 
     /// Spawns one task.
     fn spawn(
@@ -244,6 +250,18 @@ fn validate_contract(contract: RuntimeContract) -> Result<(), Error> {
     }
 }
 
+fn validate_execution_profile(profile: RuntimeExecutionProfile) -> Result<(), Error> {
+    let known_modes = RuntimeExecutionModes::PORTLESS_COOPERATIVE
+        | RuntimeExecutionModes::PORTED_COOPERATIVE
+        | RuntimeExecutionModes::BUDGETED
+        | RuntimeExecutionModes::PREEMPTIVE;
+    if profile.revision == 1 && profile.modes.bits() != 0 && known_modes.contains(profile.modes) {
+        Ok(())
+    } else {
+        Err(Error::IncompatibleExecutionProfile)
+    }
+}
+
 /// Installs the firmware's sole runtime implementation.
 ///
 /// Reinstalling the same static implementation is idempotent. Installing a
@@ -251,6 +269,7 @@ fn validate_contract(contract: RuntimeContract) -> Result<(), Error> {
 /// compete for the same scheduler resources.
 pub fn install(runtime: &'static dyn Runtime) -> Result<(), Error> {
     validate_contract(runtime.contract())?;
+    validate_execution_profile(runtime.execution_profile())?;
     critical_section::with(|cs| match RUNTIME.borrow(cs).get() {
         None => {
             RUNTIME.borrow(cs).set(Some(runtime));
@@ -266,6 +285,11 @@ pub fn runtime_contract() -> Result<RuntimeContract, Error> {
     with_runtime(|runtime| Ok(runtime.contract()))
 }
 
+/// Returns scheduling guarantees backed by the installed target resources.
+pub fn runtime_execution_profile() -> Result<RuntimeExecutionProfile, Error> {
+    with_runtime(|runtime| Ok(runtime.execution_profile()))
+}
+
 /// Proves that the installed backend satisfies an adapter's requirements.
 ///
 /// Radio adapters should call this before allocating tasks or publishing
@@ -278,6 +302,24 @@ pub fn require_runtime_contract(required: RuntimeContract) -> Result<RuntimeCont
         } else {
             Err(Error::IncompatibleContract)
         }
+    })
+}
+
+/// Proves both semantic capabilities and executable scheduling guarantees.
+pub fn require_runtime(required: RuntimeRequirements) -> Result<RuntimeRequirements, Error> {
+    with_runtime(|runtime| {
+        let contract = runtime.contract();
+        if !contract.satisfies(required.contract) {
+            return Err(Error::IncompatibleContract);
+        }
+        let execution_profile = runtime.execution_profile();
+        if !execution_profile.satisfies(required.execution_profile) {
+            return Err(Error::IncompatibleExecutionProfile);
+        }
+        Ok(RuntimeRequirements {
+            contract,
+            execution_profile,
+        })
     })
 }
 
@@ -492,6 +534,10 @@ mod tests {
             RuntimeContract::V1
         }
 
+        fn execution_profile(&self) -> RuntimeExecutionProfile {
+            RuntimeExecutionProfile::V1_PORTED
+        }
+
         fn spawn(
             &self,
             _entry: TaskEntry,
@@ -611,8 +657,19 @@ mod tests {
         unsafe { mutex_destroy(mutex).unwrap() };
         assert_eq!(runtime_contract().unwrap(), RuntimeContract::V1);
         assert_eq!(
+            runtime_execution_profile().unwrap(),
+            RuntimeExecutionProfile::V1_PORTED
+        );
+        assert_eq!(
             require_runtime_contract(RuntimeContract::V1).unwrap(),
             RuntimeContract::V1
+        );
+        assert_eq!(
+            require_runtime(RuntimeRequirements::V1_PORTED_COOPERATIVE).unwrap(),
+            RuntimeRequirements {
+                contract: RuntimeContract::V1,
+                execution_profile: RuntimeExecutionProfile::V1_PORTED,
+            }
         );
     }
 
@@ -625,6 +682,13 @@ mod tests {
         assert_eq!(
             validate_contract(incomplete),
             Err(Error::IncompatibleContract)
+        );
+        assert_eq!(
+            validate_execution_profile(RuntimeExecutionProfile {
+                revision: 1,
+                modes: RuntimeExecutionModes::NONE,
+            }),
+            Err(Error::IncompatibleExecutionProfile)
         );
     }
 }

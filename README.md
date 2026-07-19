@@ -19,15 +19,21 @@ priority semantics: `TaskPriority` accepts 0 through 31, with lower numeric
 values outranking higher values. A backend with the wrong major version or a
 missing capability is rejected before partial radio initialization.
 
+Scheduling guarantees are advertised separately through a versioned execution
+profile. Port-less cooperative execution is distinct from timer/SWI-backed
+cooperative, budgeted, and preemptive modes, so adapters can fail before
+initialization when the target lacks the required switch-delivery mechanism.
+
 `conformance` is a separate, no-heap `Scenario -> Action -> Observation`
 harness for executing the same semantic checks against deterministic runtime
-backends. Reports carry a schema version, backend revision, capability bits and
-per-scenario status, and can be emitted as allocation-free JSON for CI. The
+backends. Reports carry a schema version, backend revision, capability bits,
+execution profile revision/modes and per-scenario status, and can be emitted as
+allocation-free JSON for CI. The
 suite covers priority/FIFO ordering, nested scheduler-lock deferral, sleep
 deadlines, nested interrupt exit, task exit/slot reuse, semaphore direct
 handoff and timeout cleanup, recursive mutex priority inheritance, and stale
-task identities. Tick wrap, zero-delay yield, and the complete RF
-archive-bound execution profile remain separate A5R closure gates.
+task identities. Tick wrap, zero-delay yield, and the RF archive-bound task
+classification remain separate A5R closure gates.
 
 Task-table capacity is distinct from allocator/control-block exhaustion:
 `Runtime::spawn` returns `Error::NoTaskSlots` when no dynamic task slot remains,

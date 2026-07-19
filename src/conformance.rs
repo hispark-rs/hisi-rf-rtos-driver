@@ -7,10 +7,10 @@
 use core::fmt;
 use core::num::NonZeroU32;
 
-use crate::{Error, RuntimeContract, TaskPriority};
+use crate::{Error, RuntimeContract, RuntimeExecutionProfile, TaskPriority};
 
 /// Version of the conformance scenario and report schema.
-pub const SCHEMA_VERSION: u16 = 1;
+pub const SCHEMA_VERSION: u16 = 2;
 
 /// Logical task identity used only inside deterministic scenarios.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -274,6 +274,9 @@ pub trait Backend {
     /// Contract advertised by the backend under test.
     fn contract(&self) -> RuntimeContract;
 
+    /// Scheduling guarantees backed by the deterministic backend.
+    fn execution_profile(&self) -> RuntimeExecutionProfile;
+
     /// Stable backend revision included in reports.
     fn revision(&self) -> &'static str;
 
@@ -315,6 +318,8 @@ pub struct Report<const N: usize> {
     pub schema_version: u16,
     /// Contract advertised by the backend.
     pub contract: RuntimeContract,
+    /// Scheduling guarantees exercised by this report.
+    pub execution_profile: RuntimeExecutionProfile,
     /// Stable backend revision.
     pub backend_revision: &'static str,
     /// One result per requested scenario.
@@ -331,11 +336,13 @@ impl<const N: usize> Report<N> {
     pub fn write_json(&self, output: &mut impl fmt::Write) -> fmt::Result {
         write!(
             output,
-            "{{\"schema_version\":{},\"contract\":{{\"major\":{},\"minor\":{},\"capabilities\":{}}},\"backend_revision\":",
+            "{{\"schema_version\":{},\"contract\":{{\"major\":{},\"minor\":{},\"capabilities\":{}}},\"execution_profile\":{{\"revision\":{},\"modes\":{}}},\"backend_revision\":",
             self.schema_version,
             self.contract.version.major,
             self.contract.version.minor,
             self.contract.capabilities.bits(),
+            self.execution_profile.revision,
+            self.execution_profile.modes.bits(),
         )?;
         write_json_string(output, self.backend_revision)?;
         output.write_str(",\"scenarios\":[")?;
@@ -375,6 +382,7 @@ pub fn run_suite<B: Backend, const N: usize>(
     Report {
         schema_version: SCHEMA_VERSION,
         contract: backend.contract(),
+        execution_profile: backend.execution_profile(),
         backend_revision: backend.revision(),
         results,
     }
@@ -1089,6 +1097,10 @@ mod tests {
             RuntimeContract::V1
         }
 
+        fn execution_profile(&self) -> RuntimeExecutionProfile {
+            RuntimeExecutionProfile::V1_PORTED
+        }
+
         fn revision(&self) -> &'static str {
             "test\"backend"
         }
@@ -1132,6 +1144,7 @@ mod tests {
         let mut json = std::string::String::new();
         report.write_json(&mut json).unwrap();
         assert!(json.contains("\"backend_revision\":\"test\\\"backend\""));
+        assert!(json.contains("\"execution_profile\":{\"revision\":1,\"modes\":14}"));
         assert!(json.contains("\"status\":\"failed\""));
     }
 }

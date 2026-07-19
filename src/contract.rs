@@ -155,6 +155,108 @@ pub struct RuntimeContract {
     pub capabilities: RuntimeCapabilities,
 }
 
+/// Scheduling modes a runtime can execute with its installed target support.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct RuntimeExecutionModes(u32);
+
+impl RuntimeExecutionModes {
+    /// No executable scheduling mode is available.
+    pub const NONE: Self = Self(0);
+    /// Port-less cooperative scheduling at explicit scheduling points only.
+    pub const PORTLESS_COOPERATIVE: Self = Self(1 << 0);
+    /// Cooperative tasks backed by timer/SWI switch delivery.
+    pub const PORTED_COOPERATIVE: Self = Self(1 << 1);
+    /// Periodic CPU quota with timer-enforced throttling.
+    pub const BUDGETED: Self = Self(1 << 2);
+    /// Priority preemption and equal-priority time slicing.
+    pub const PREEMPTIVE: Self = Self(1 << 3);
+
+    /// Creates a mode set from its stable bit representation.
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    /// Returns the stable bit representation.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Returns true when every required mode is implemented.
+    pub const fn contains(self, required: Self) -> bool {
+        self.0 & required.0 == required.0
+    }
+}
+
+impl BitOr for RuntimeExecutionModes {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for RuntimeExecutionModes {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+/// Versioned scheduling guarantees offered by one installed runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeExecutionProfile {
+    /// Profile schema revision. Revisions are compared exactly.
+    pub revision: u16,
+    /// Scheduling modes backed by the installed target resources.
+    pub modes: RuntimeExecutionModes,
+}
+
+impl RuntimeExecutionProfile {
+    /// Port-less runtime that can switch only at explicit cooperative points.
+    pub const V1_PORTLESS_COOPERATIVE: Self = Self {
+        revision: 1,
+        modes: RuntimeExecutionModes::PORTLESS_COOPERATIVE,
+    };
+
+    /// Runtime with timer and deferred-reschedule delivery installed.
+    pub const V1_PORTED: Self = Self {
+        revision: 1,
+        modes: RuntimeExecutionModes(
+            RuntimeExecutionModes::PORTED_COOPERATIVE.0
+                | RuntimeExecutionModes::BUDGETED.0
+                | RuntimeExecutionModes::PREEMPTIVE.0,
+        ),
+    };
+
+    /// Minimum profile required by the current WS63 radio compatibility path.
+    pub const V1_PORTED_COOPERATIVE: Self = Self {
+        revision: 1,
+        modes: RuntimeExecutionModes::PORTED_COOPERATIVE,
+    };
+
+    /// Returns whether this profile satisfies one adapter requirement.
+    pub const fn satisfies(self, required: Self) -> bool {
+        self.revision == required.revision && self.modes.contains(required.modes)
+    }
+}
+
+/// Versioned semantic and execution requirements of one radio adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeRequirements {
+    /// Required task and synchronization contract.
+    pub contract: RuntimeContract,
+    /// Required scheduling guarantees.
+    pub execution_profile: RuntimeExecutionProfile,
+}
+
+impl RuntimeRequirements {
+    /// Contract v1 with timer/SWI-backed cooperative execution.
+    pub const V1_PORTED_COOPERATIVE: Self = Self {
+        contract: RuntimeContract::V1,
+        execution_profile: RuntimeExecutionProfile::V1_PORTED_COOPERATIVE,
+    };
+}
+
 impl RuntimeContract {
     /// Complete runtime contract implemented by current native backends.
     pub const V1: Self = Self {
@@ -205,5 +307,23 @@ mod tests {
             ),
         };
         assert!(!missing_mutex.satisfies(RuntimeContract::V1));
+    }
+
+    #[test]
+    fn execution_profiles_do_not_conflate_portless_and_ported_modes() {
+        assert!(
+            RuntimeExecutionProfile::V1_PORTED
+                .satisfies(RuntimeExecutionProfile::V1_PORTED_COOPERATIVE)
+        );
+        assert!(
+            !RuntimeExecutionProfile::V1_PORTLESS_COOPERATIVE
+                .satisfies(RuntimeExecutionProfile::V1_PORTED_COOPERATIVE)
+        );
+        assert!(
+            !RuntimeExecutionProfile::V1_PORTED.satisfies(RuntimeExecutionProfile {
+                revision: 2,
+                modes: RuntimeExecutionModes::PORTED_COOPERATIVE,
+            })
+        );
     }
 }
