@@ -7,10 +7,17 @@
 
 #![no_std]
 
+mod contract;
+
 use core::cell::Cell;
 use core::ffi::c_void;
 use core::num::{NonZeroU32, NonZeroUsize};
 use critical_section::Mutex;
+
+pub use contract::{
+    InvalidTaskPriority, RuntimeCapabilities, RuntimeContract, RuntimeContractVersion,
+    TASK_PRIORITY_LEVELS, TaskPriority,
+};
 
 /// Entry point used by a vendor-compatible task.
 pub type TaskEntry = extern "C" fn(*mut c_void) -> *mut c_void;
@@ -77,9 +84,8 @@ impl MutexHandle {
 pub struct TaskConfig {
     /// Requested stack allocation in bytes.
     pub stack_size: NonZeroUsize,
-    /// Runtime-defined priority. Larger/smaller ordering is documented by the
-    /// selected runtime rather than guessed by this contract.
-    pub priority: u8,
+    /// Validated contract-v1 priority. Lower numeric values run first.
+    pub priority: TaskPriority,
 }
 
 /// A bounded or unbounded wait request.
@@ -124,6 +130,8 @@ pub enum Error {
     NotInstalled,
     /// A different runtime was already installed.
     AlreadyInstalled,
+    /// The runtime's version or capabilities cannot satisfy contract v1.
+    IncompatibleContract,
     /// A task, semaphore, stack, or internal control block could not be allocated.
     ResourceExhausted,
     /// The runtime has no dynamic task slot available for another task.
@@ -147,6 +155,9 @@ pub enum Error {
 /// [`Runtime::interrupt_enter`] and [`Runtime::interrupt_exit`] so a backend can
 /// distinguish task-context wakeups from interrupt-context wakeups.
 pub trait Runtime: Sync {
+    /// Describes the versioned semantics implemented by this backend.
+    fn contract(&self) -> RuntimeContract;
+
     /// Spawns one task.
     fn spawn(
         &self,
@@ -165,7 +176,7 @@ pub trait Runtime: Sync {
     fn current_task(&self) -> Result<TaskId, Error>;
 
     /// Changes a live task's runtime-defined scheduling priority.
-    fn set_task_priority(&self, task: TaskId, priority: u8) -> Result<(), Error>;
+    fn set_task_priority(&self, task: TaskId, priority: TaskPriority) -> Result<(), Error>;
 
     /// Prevents scheduler-driven preemption of the current task. Calls nest.
     fn lock_scheduler(&self) -> Result<(), Error>;
@@ -224,12 +235,21 @@ pub trait Runtime: Sync {
 
 static RUNTIME: Mutex<Cell<Option<&'static dyn Runtime>>> = Mutex::new(Cell::new(None));
 
+fn validate_contract(contract: RuntimeContract) -> Result<(), Error> {
+    if contract.satisfies(RuntimeContract::V1) {
+        Ok(())
+    } else {
+        Err(Error::IncompatibleContract)
+    }
+}
+
 /// Installs the firmware's sole runtime implementation.
 ///
 /// Reinstalling the same static implementation is idempotent. Installing a
 /// different implementation fails, so two radio/runtime stacks cannot silently
 /// compete for the same scheduler resources.
 pub fn install(runtime: &'static dyn Runtime) -> Result<(), Error> {
+    validate_contract(runtime.contract())?;
     critical_section::with(|cs| match RUNTIME.borrow(cs).get() {
         None => {
             RUNTIME.borrow(cs).set(Some(runtime));
@@ -237,6 +257,26 @@ pub fn install(runtime: &'static dyn Runtime) -> Result<(), Error> {
         }
         Some(current) if core::ptr::eq(current, runtime) => Ok(()),
         Some(_) => Err(Error::AlreadyInstalled),
+    })
+}
+
+/// Returns the installed runtime's versioned contract.
+pub fn runtime_contract() -> Result<RuntimeContract, Error> {
+    with_runtime(|runtime| Ok(runtime.contract()))
+}
+
+/// Proves that the installed backend satisfies an adapter's requirements.
+///
+/// Radio adapters should call this before allocating tasks or publishing
+/// callbacks. A mismatch fails before partial initialization begins.
+pub fn require_runtime_contract(required: RuntimeContract) -> Result<RuntimeContract, Error> {
+    with_runtime(|runtime| {
+        let offered = runtime.contract();
+        if offered.satisfies(required) {
+            Ok(offered)
+        } else {
+            Err(Error::IncompatibleContract)
+        }
     })
 }
 
@@ -267,7 +307,7 @@ pub fn current_task() -> Result<TaskId, Error> {
 }
 
 /// Changes a task's scheduling priority through the installed runtime.
-pub fn set_task_priority(task: TaskId, priority: u8) -> Result<(), Error> {
+pub fn set_task_priority(task: TaskId, priority: TaskPriority) -> Result<(), Error> {
     with_runtime(|runtime| runtime.set_task_priority(task, priority))
 }
 
@@ -447,6 +487,10 @@ mod tests {
     struct TestRuntime(AtomicU32);
 
     impl Runtime for TestRuntime {
+        fn contract(&self) -> RuntimeContract {
+            RuntimeContract::V1
+        }
+
         fn spawn(
             &self,
             _entry: TaskEntry,
@@ -468,7 +512,7 @@ mod tests {
             Ok(TaskId::from_raw(7))
         }
 
-        fn set_task_priority(&self, _task: TaskId, _priority: u8) -> Result<(), Error> {
+        fn set_task_priority(&self, _task: TaskId, _priority: TaskPriority) -> Result<(), Error> {
             Ok(())
         }
 
@@ -539,13 +583,13 @@ mod tests {
             core::ptr::null_mut(),
             TaskConfig {
                 stack_size: NonZeroUsize::new(1024).unwrap(),
-                priority: 3,
+                priority: TaskPriority::new(3).unwrap(),
             },
         )
         .unwrap();
         assert_eq!(id.into_raw(), 1);
         assert_eq!(current_task().unwrap().into_raw(), 7);
-        set_task_priority(id, 2).unwrap();
+        set_task_priority(id, TaskPriority::new(2).unwrap()).unwrap();
         lock_scheduler().unwrap();
         unlock_scheduler().unwrap();
 
@@ -564,5 +608,22 @@ mod tests {
         );
         mutex_unlock(mutex).unwrap();
         unsafe { mutex_destroy(mutex).unwrap() };
+        assert_eq!(runtime_contract().unwrap(), RuntimeContract::V1);
+        assert_eq!(
+            require_runtime_contract(RuntimeContract::V1).unwrap(),
+            RuntimeContract::V1
+        );
+    }
+
+    #[test]
+    fn contract_validation_rejects_missing_capabilities() {
+        let incomplete = RuntimeContract {
+            version: RuntimeContractVersion::V1_0,
+            capabilities: RuntimeCapabilities::TASKS,
+        };
+        assert_eq!(
+            validate_contract(incomplete),
+            Err(Error::IncompatibleContract)
+        );
     }
 }

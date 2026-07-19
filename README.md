@@ -13,6 +13,12 @@ capabilities. Priority inheritance belongs to the selected runtime; chip ABI
 adapters translate only the vendor symbols used by their pinned blob and do not
 turn this crate into a LiteOS compatibility surface.
 
+Before a radio adapter allocates resources it can require a versioned
+`RuntimeContract`. Contract v1 fixes both the capability set and scheduling
+priority semantics: `TaskPriority` accepts 0 through 31, with lower numeric
+values outranking higher values. A backend with the wrong major version or a
+missing capability is rejected before partial radio initialization.
+
 Task-table capacity is distinct from allocator/control-block exhaustion:
 `Runtime::spawn` returns `Error::NoTaskSlots` when no dynamic task slot remains,
 while `Error::ResourceExhausted` continues to describe stack, semaphore, mutex,
