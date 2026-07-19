@@ -10,7 +10,7 @@ use core::num::NonZeroU32;
 use crate::{Error, RuntimeContract, RuntimeExecutionProfile, TaskPriority};
 
 /// Version of the conformance scenario and report schema.
-pub const SCHEMA_VERSION: u16 = 3;
+pub const SCHEMA_VERSION: u16 = 4;
 
 /// Logical task identity used only inside deterministic scenarios.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,6 +78,8 @@ pub enum ActionOutcome {
     StaleIdentityRejected,
     /// Effective priority observed for one actor.
     PriorityObserved(TaskPriority),
+    /// The backend rejected an operation before changing observable state.
+    Rejected(Error),
 }
 
 /// Timeout mode used by deterministic wait scenarios.
@@ -254,6 +256,12 @@ pub enum ScenarioId {
     SameDeadlineFifo,
     /// A semaphore grant selects the highest-priority FIFO waiter.
     SemaphoreHighestPriorityWaiter,
+    /// Releasing an unlocked scheduler fails without changing lock depth.
+    UnbalancedSchedulerUnlock,
+    /// Leaving task context as though it were an interrupt fails closed.
+    UnbalancedInterruptExit,
+    /// Blocking operations are rejected while the scheduler is locked.
+    BlockingInSchedulerLock,
 }
 
 impl ScenarioId {
@@ -273,6 +281,9 @@ impl ScenarioId {
             Self::WaitForever => "wait_forever",
             Self::SameDeadlineFifo => "same_deadline_fifo",
             Self::SemaphoreHighestPriorityWaiter => "semaphore_highest_priority_waiter",
+            Self::UnbalancedSchedulerUnlock => "unbalanced_scheduler_unlock",
+            Self::UnbalancedInterruptExit => "unbalanced_interrupt_exit",
+            Self::BlockingInSchedulerLock => "blocking_in_scheduler_lock",
         }
     }
 }
@@ -1268,8 +1279,148 @@ const SEMAPHORE_PRIORITY_STEPS: &[Step] = &[
     },
 ];
 
+const UNBALANCED_SCHEDULER_UNLOCK_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Cooperative,
+            main_priority: TaskPriority::LOWEST,
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::MAIN),
+            outcome: Some(ActionOutcome::Completed),
+            scheduler_lock_depth: Some(0),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::UnlockScheduler,
+        expected: ExpectedObservation {
+            running: Some(ActorId::MAIN),
+            outcome: Some(ActionOutcome::Rejected(Error::InvalidContext)),
+            scheduler_lock_depth: Some(0),
+            ..ANY
+        },
+    },
+];
+
+const UNBALANCED_INTERRUPT_EXIT_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Cooperative,
+            main_priority: TaskPriority::LOWEST,
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::MAIN),
+            outcome: Some(ActionOutcome::Completed),
+            interrupt_depth: Some(0),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::ExitInterrupt,
+        expected: ExpectedObservation {
+            running: Some(ActorId::MAIN),
+            outcome: Some(ActionOutcome::Rejected(Error::InvalidContext)),
+            interrupt_depth: Some(0),
+            ..ANY
+        },
+    },
+];
+
+const BLOCKING_IN_SCHEDULER_LOCK_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Cooperative,
+            main_priority: TaskPriority::LOWEST,
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::MAIN),
+            outcome: Some(ActionOutcome::Completed),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::MutexLock {
+            timeout: Wait::NoWait,
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::MAIN),
+            outcome: Some(ActionOutcome::Acquired),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_A,
+            priority: TaskPriority::LOWEST,
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::MAIN),
+            outcome: Some(ActionOutcome::Spawned),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::Yield,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            outcome: Some(ActionOutcome::ContextSwitched),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::LockScheduler,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            outcome: Some(ActionOutcome::Completed),
+            scheduler_lock_depth: Some(1),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::Sleep { milliseconds: 1 },
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            outcome: Some(ActionOutcome::Rejected(Error::InvalidContext)),
+            scheduler_lock_depth: Some(1),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::SemaphoreWait {
+            timeout: Wait::Forever,
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            outcome: Some(ActionOutcome::Rejected(Error::InvalidContext)),
+            scheduler_lock_depth: Some(1),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::MutexLock {
+            timeout: Wait::Forever,
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            outcome: Some(ActionOutcome::Rejected(Error::InvalidContext)),
+            scheduler_lock_depth: Some(1),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::UnlockScheduler,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            outcome: Some(ActionOutcome::Completed),
+            scheduler_lock_depth: Some(0),
+            ..ANY
+        },
+    },
+];
+
 /// Shared scheduler and synchronization semantics required by contract V1.
-pub const V1_SCENARIOS: [Scenario; 13] = [
+pub const V1_SCENARIOS: [Scenario; 16] = [
     Scenario {
         id: ScenarioId::PriorityThenFifo,
         steps: PRIORITY_FIFO_STEPS,
@@ -1321,6 +1472,18 @@ pub const V1_SCENARIOS: [Scenario; 13] = [
     Scenario {
         id: ScenarioId::SemaphoreHighestPriorityWaiter,
         steps: SEMAPHORE_PRIORITY_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::UnbalancedSchedulerUnlock,
+        steps: UNBALANCED_SCHEDULER_UNLOCK_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::UnbalancedInterruptExit,
+        steps: UNBALANCED_INTERRUPT_EXIT_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::BlockingInSchedulerLock,
+        steps: BLOCKING_IN_SCHEDULER_LOCK_STEPS,
     },
 ];
 
