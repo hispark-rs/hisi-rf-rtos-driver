@@ -5,6 +5,7 @@
 //! behind that trait without adding test controls to the production ABI.
 
 use core::fmt;
+use core::num::NonZeroU32;
 
 use crate::{Error, RuntimeContract, TaskPriority};
 
@@ -69,6 +70,25 @@ pub enum ActionOutcome {
     Acquired,
     /// A wait deadline elapsed.
     TimedOut,
+    /// A resource grant was handed directly to a waiter.
+    Granted,
+    /// A task identity was retained for a later liveness check.
+    IdentityRemembered,
+    /// A retained identity was correctly rejected after slot reuse.
+    StaleIdentityRejected,
+    /// Effective priority observed for one actor.
+    PriorityObserved(TaskPriority),
+}
+
+/// Timeout mode used by deterministic wait scenarios.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Wait {
+    /// Return immediately when the resource is unavailable.
+    NoWait,
+    /// Wait until a finite monotonic deadline.
+    Milliseconds(NonZeroU32),
+    /// Wait without a deadline.
+    Forever,
 }
 
 /// One operation in a deterministic runtime scenario.
@@ -115,6 +135,37 @@ pub enum Action {
     },
     /// Exit the current task.
     ExitTask,
+    /// Wait on the scenario counting semaphore.
+    SemaphoreWait {
+        /// Wait mode.
+        timeout: Wait,
+    },
+    /// Release the scenario counting semaphore.
+    SemaphorePost,
+    /// Observe whether an actor owns a direct resource grant.
+    ObserveGrant {
+        /// Actor whose pending grant is inspected.
+        actor: ActorId,
+    },
+    /// Acquire the scenario recursive mutex.
+    MutexLock {
+        /// Wait mode.
+        timeout: Wait,
+    },
+    /// Release one recursion level of the scenario mutex.
+    MutexUnlock,
+    /// Observe an actor's effective scheduling priority.
+    ObservePriority {
+        /// Actor whose effective priority is inspected.
+        actor: ActorId,
+    },
+    /// Retain an actor's current generation-bearing identity.
+    RememberIdentity {
+        /// Actor whose identity is retained.
+        actor: ActorId,
+    },
+    /// Validate that the retained identity no longer names a live task.
+    ValidateRememberedIdentity,
 }
 
 /// State returned after applying one action.
@@ -182,6 +233,14 @@ pub enum ScenarioId {
     NestedInterruptExit,
     /// Task exit switches away and permits later slot reuse.
     TaskExitAndReuse,
+    /// Semaphore post transfers a grant directly to the first waiter.
+    SemaphoreDirectHandoff,
+    /// Timed-out semaphore waiters are removed before a later post.
+    SemaphoreTimeoutCleanup,
+    /// Recursive ownership, direct handoff and priority inheritance compose.
+    MutexPriorityInheritance,
+    /// A generation-bearing task identity becomes stale after slot reuse.
+    StaleTaskIdentity,
 }
 
 impl ScenarioId {
@@ -193,6 +252,10 @@ impl ScenarioId {
             Self::SleepDeadline => "sleep_deadline",
             Self::NestedInterruptExit => "nested_interrupt_exit",
             Self::TaskExitAndReuse => "task_exit_and_reuse",
+            Self::SemaphoreDirectHandoff => "semaphore_direct_handoff",
+            Self::SemaphoreTimeoutCleanup => "semaphore_timeout_cleanup",
+            Self::MutexPriorityInheritance => "mutex_priority_inheritance",
+            Self::StaleTaskIdentity => "stale_task_identity",
         }
     }
 }
@@ -670,9 +733,311 @@ const TASK_EXIT_STEPS: &[Step] = &[
     },
 ];
 
-/// Initial shared scenarios. Additional synchronization, timeout, IRQ and task
-/// lifecycle scenarios must be added before A5R can be declared complete.
-pub const V1_SCENARIOS: [Scenario; 5] = [
+const SEMAPHORE_HANDOFF_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Cooperative,
+            main_priority: TaskPriority::LOWEST,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_A,
+            priority: TaskPriority::new(4).unwrap(),
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_B,
+            priority: TaskPriority::new(4).unwrap(),
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Yield,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::SemaphoreWait {
+            timeout: Wait::Forever,
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_B),
+            subject: Some((ActorId::WORKER_A, ActorState::Blocked)),
+            outcome: Some(ActionOutcome::ContextSwitched),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::SemaphorePost,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_B),
+            subject: Some((ActorId::WORKER_A, ActorState::Ready)),
+            outcome: Some(ActionOutcome::Granted),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::ObserveGrant {
+            actor: ActorId::WORKER_A,
+        },
+        expected: ExpectedObservation {
+            subject: Some((ActorId::WORKER_A, ActorState::Ready)),
+            outcome: Some(ActionOutcome::Acquired),
+            ..ANY
+        },
+    },
+];
+
+const SEMAPHORE_TIMEOUT_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Cooperative,
+            main_priority: TaskPriority::LOWEST,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_A,
+            priority: TaskPriority::new(4).unwrap(),
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Yield,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::SemaphoreWait {
+            timeout: Wait::Milliseconds(NonZeroU32::new(5).unwrap()),
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::MAIN),
+            subject: Some((ActorId::WORKER_A, ActorState::Blocked)),
+            outcome: Some(ActionOutcome::ContextSwitched),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::AdvanceTime { milliseconds: 5 },
+        expected: ANY,
+    },
+    Step {
+        action: Action::ObserveGrant {
+            actor: ActorId::WORKER_A,
+        },
+        expected: ExpectedObservation {
+            subject: Some((ActorId::WORKER_A, ActorState::Ready)),
+            outcome: Some(ActionOutcome::TimedOut),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::SemaphorePost,
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::Completed),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::Yield,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::SemaphoreWait {
+            timeout: Wait::NoWait,
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            outcome: Some(ActionOutcome::Acquired),
+            ..ANY
+        },
+    },
+];
+
+const MUTEX_PI_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Cooperative,
+            main_priority: TaskPriority::LOWEST,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_A,
+            priority: TaskPriority::new(20).unwrap(),
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Yield,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::MutexLock {
+            timeout: Wait::Forever,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::Acquired),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::MutexLock {
+            timeout: Wait::Forever,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::Acquired),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_B,
+            priority: TaskPriority::new(2).unwrap(),
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Yield,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_B),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::MutexLock {
+            timeout: Wait::Forever,
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            subject: Some((ActorId::WORKER_B, ActorState::Blocked)),
+            outcome: Some(ActionOutcome::ContextSwitched),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::ObservePriority {
+            actor: ActorId::WORKER_A,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::PriorityObserved(
+                TaskPriority::new(2).unwrap(),
+            )),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::MutexUnlock,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            outcome: Some(ActionOutcome::Completed),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::MutexUnlock,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            subject: Some((ActorId::WORKER_B, ActorState::Ready)),
+            outcome: Some(ActionOutcome::Granted),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::ObservePriority {
+            actor: ActorId::WORKER_A,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::PriorityObserved(
+                TaskPriority::new(20).unwrap(),
+            )),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::ObserveGrant {
+            actor: ActorId::WORKER_B,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::Acquired),
+            ..ANY
+        },
+    },
+];
+
+const STALE_IDENTITY_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Cooperative,
+            main_priority: TaskPriority::LOWEST,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_A,
+            priority: TaskPriority::new(4).unwrap(),
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::RememberIdentity {
+            actor: ActorId::WORKER_A,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::IdentityRemembered),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::Yield,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::ExitTask,
+        expected: ExpectedObservation {
+            running: Some(ActorId::MAIN),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_A,
+            priority: TaskPriority::new(4).unwrap(),
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::ValidateRememberedIdentity,
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::StaleIdentityRejected),
+            ..ANY
+        },
+    },
+];
+
+/// Shared scheduler and synchronization semantics required by contract V1.
+pub const V1_SCENARIOS: [Scenario; 9] = [
     Scenario {
         id: ScenarioId::PriorityThenFifo,
         steps: PRIORITY_FIFO_STEPS,
@@ -692,6 +1057,22 @@ pub const V1_SCENARIOS: [Scenario; 5] = [
     Scenario {
         id: ScenarioId::TaskExitAndReuse,
         steps: TASK_EXIT_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::SemaphoreDirectHandoff,
+        steps: SEMAPHORE_HANDOFF_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::SemaphoreTimeoutCleanup,
+        steps: SEMAPHORE_TIMEOUT_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::MutexPriorityInheritance,
+        steps: MUTEX_PI_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::StaleTaskIdentity,
+        steps: STALE_IDENTITY_STEPS,
     },
 ];
 

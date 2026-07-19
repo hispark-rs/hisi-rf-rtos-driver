@@ -23,10 +23,11 @@ missing capability is rejected before partial radio initialization.
 harness for executing the same semantic checks against deterministic runtime
 backends. Reports carry a schema version, backend revision, capability bits and
 per-scenario status, and can be emitted as allocation-free JSON for CI. The
-initial suite covers priority/FIFO ordering, nested scheduler-lock deferral,
-sleep deadlines, nested interrupt exit, and task exit/slot reuse. Semaphore,
-mutex priority-inheritance, wait timeout/cleanup and stale-handle scenarios
-remain required before the v1 conformance suite is considered complete.
+suite covers priority/FIFO ordering, nested scheduler-lock deferral, sleep
+deadlines, nested interrupt exit, task exit/slot reuse, semaphore direct
+handoff and timeout cleanup, recursive mutex priority inheritance, and stale
+task identities. Tick wrap, zero-delay yield, and the complete RF
+archive-bound execution profile remain separate A5R closure gates.
 
 Task-table capacity is distinct from allocator/control-block exhaustion:
 `Runtime::spawn` returns `Error::NoTaskSlots` when no dynamic task slot remains,
