@@ -32,8 +32,9 @@ allocation-free JSON for CI. The
 suite covers priority/FIFO ordering, nested scheduler-lock deferral, sleep
 deadlines, nested interrupt exit, task exit/slot reuse, semaphore direct
 handoff and timeout cleanup, recursive mutex priority inheritance, and stale
-task identities. Tick wrap, zero-delay yield, and the RF archive-bound task
-classification remain separate A5R closure gates.
+task identities. It also fixes zero-delay-as-yield, wait-forever, equal-deadline
+FIFO, and highest-priority FIFO semaphore selection. Tick rounding/wrap and the
+RF archive-bound task classification remain separate A5R closure gates.
 
 Task-table capacity is distinct from allocator/control-block exhaustion:
 `Runtime::spawn` returns `Error::NoTaskSlots` when no dynamic task slot remains,

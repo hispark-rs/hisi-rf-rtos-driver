@@ -10,7 +10,7 @@ use core::num::NonZeroU32;
 use crate::{Error, RuntimeContract, RuntimeExecutionProfile, TaskPriority};
 
 /// Version of the conformance scenario and report schema.
-pub const SCHEMA_VERSION: u16 = 2;
+pub const SCHEMA_VERSION: u16 = 3;
 
 /// Logical task identity used only inside deterministic scenarios.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,6 +110,11 @@ pub enum Action {
     },
     /// Yield from the current task.
     Yield,
+    /// Apply the vendor delay convention: zero yields, non-zero sleeps.
+    Delay {
+        /// Delay in milliseconds. Zero is an explicit scheduling point.
+        milliseconds: u32,
+    },
     /// Enter one scheduler-lock nesting level.
     LockScheduler,
     /// Leave one scheduler-lock nesting level.
@@ -241,6 +246,14 @@ pub enum ScenarioId {
     MutexPriorityInheritance,
     /// A generation-bearing task identity becomes stale after slot reuse.
     StaleTaskIdentity,
+    /// A zero-duration delay has exactly the same scheduling effect as yield.
+    ZeroDelayYields,
+    /// A wait-forever request cannot expire as monotonic time advances.
+    WaitForever,
+    /// Equal deadlines become ready in deterministic FIFO order.
+    SameDeadlineFifo,
+    /// A semaphore grant selects the highest-priority FIFO waiter.
+    SemaphoreHighestPriorityWaiter,
 }
 
 impl ScenarioId {
@@ -256,6 +269,10 @@ impl ScenarioId {
             Self::SemaphoreTimeoutCleanup => "semaphore_timeout_cleanup",
             Self::MutexPriorityInheritance => "mutex_priority_inheritance",
             Self::StaleTaskIdentity => "stale_task_identity",
+            Self::ZeroDelayYields => "zero_delay_yields",
+            Self::WaitForever => "wait_forever",
+            Self::SameDeadlineFifo => "same_deadline_fifo",
+            Self::SemaphoreHighestPriorityWaiter => "semaphore_highest_priority_waiter",
         }
     }
 }
@@ -1044,8 +1061,215 @@ const STALE_IDENTITY_STEPS: &[Step] = &[
     },
 ];
 
+const ZERO_DELAY_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Cooperative,
+            main_priority: TaskPriority::LOWEST,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_A,
+            priority: TaskPriority::new(4).unwrap(),
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Delay { milliseconds: 0 },
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            subject: Some((ActorId::MAIN, ActorState::Ready)),
+            outcome: Some(ActionOutcome::ContextSwitched),
+            ..ANY
+        },
+    },
+];
+
+const WAIT_FOREVER_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Cooperative,
+            main_priority: TaskPriority::LOWEST,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_A,
+            priority: TaskPriority::new(4).unwrap(),
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Yield,
+        expected: ANY,
+    },
+    Step {
+        action: Action::SemaphoreWait {
+            timeout: Wait::Forever,
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::MAIN),
+            subject: Some((ActorId::WORKER_A, ActorState::Blocked)),
+            outcome: Some(ActionOutcome::ContextSwitched),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::AdvanceTime {
+            milliseconds: u32::MAX,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Observe {
+            actor: ActorId::WORKER_A,
+        },
+        expected: ExpectedObservation {
+            subject: Some((ActorId::WORKER_A, ActorState::Blocked)),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::SemaphorePost,
+        expected: ExpectedObservation {
+            subject: Some((ActorId::WORKER_A, ActorState::Ready)),
+            outcome: Some(ActionOutcome::Granted),
+            ..ANY
+        },
+    },
+];
+
+const SAME_DEADLINE_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Cooperative,
+            main_priority: TaskPriority::LOWEST,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_A,
+            priority: TaskPriority::new(4).unwrap(),
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_B,
+            priority: TaskPriority::new(4).unwrap(),
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Yield,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::Sleep { milliseconds: 5 },
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_B),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::Sleep { milliseconds: 5 },
+        expected: ExpectedObservation {
+            running: Some(ActorId::MAIN),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::AdvanceTime { milliseconds: 5 },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Yield,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            outcome: Some(ActionOutcome::ContextSwitched),
+            ..ANY
+        },
+    },
+];
+
+const SEMAPHORE_PRIORITY_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Cooperative,
+            main_priority: TaskPriority::LOWEST,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_A,
+            priority: TaskPriority::new(10).unwrap(),
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Yield,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_B,
+            priority: TaskPriority::new(2).unwrap(),
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::SemaphoreWait {
+            timeout: Wait::Forever,
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_B),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::SemaphoreWait {
+            timeout: Wait::Forever,
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::MAIN),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::SemaphorePost,
+        expected: ExpectedObservation {
+            subject: Some((ActorId::WORKER_B, ActorState::Ready)),
+            outcome: Some(ActionOutcome::Granted),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::ObserveGrant {
+            actor: ActorId::WORKER_B,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::Acquired),
+            ..ANY
+        },
+    },
+];
+
 /// Shared scheduler and synchronization semantics required by contract V1.
-pub const V1_SCENARIOS: [Scenario; 9] = [
+pub const V1_SCENARIOS: [Scenario; 13] = [
     Scenario {
         id: ScenarioId::PriorityThenFifo,
         steps: PRIORITY_FIFO_STEPS,
@@ -1081,6 +1305,22 @@ pub const V1_SCENARIOS: [Scenario; 9] = [
     Scenario {
         id: ScenarioId::StaleTaskIdentity,
         steps: STALE_IDENTITY_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::ZeroDelayYields,
+        steps: ZERO_DELAY_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::WaitForever,
+        steps: WAIT_FOREVER_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::SameDeadlineFifo,
+        steps: SAME_DEADLINE_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::SemaphoreHighestPriorityWaiter,
+        steps: SEMAPHORE_PRIORITY_STEPS,
     },
 ];
 
