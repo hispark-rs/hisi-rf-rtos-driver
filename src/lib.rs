@@ -125,6 +125,15 @@ pub enum WaitOutcome {
     TimedOut,
 }
 
+/// Result of cancelling a task's pending synchronization wait.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WaitCancellationOutcome {
+    /// A queued wait or an unconsumed direct handoff was cancelled.
+    Cancelled,
+    /// The task was live but had no cancellable wait or pending grant.
+    NotWaiting,
+}
+
 /// Runtime service failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -184,6 +193,13 @@ pub trait Runtime: Sync {
 
     /// Changes a live task's runtime-defined scheduling priority.
     fn set_task_priority(&self, task: TaskId, priority: TaskPriority) -> Result<(), Error>;
+
+    /// Cancels a task's queued wait or unconsumed direct resource handoff.
+    ///
+    /// Cancelling a direct semaphore handoff returns the count to the
+    /// semaphore. Cancelling a direct mutex handoff releases that ownership and
+    /// hands it to the next waiter, if any.
+    fn cancel_wait(&self, task: TaskId) -> Result<WaitCancellationOutcome, Error>;
 
     /// Prevents scheduler-driven preemption of the current task. Calls nest.
     fn lock_scheduler(&self) -> Result<(), Error>;
@@ -303,6 +319,11 @@ pub fn require_runtime_contract(required: RuntimeContract) -> Result<RuntimeCont
             Err(Error::IncompatibleContract)
         }
     })
+}
+
+/// Cancels a live task's queued synchronization wait or pending direct grant.
+pub fn cancel_wait(task: TaskId) -> Result<WaitCancellationOutcome, Error> {
+    with_runtime(|runtime| runtime.cancel_wait(task))
 }
 
 /// Proves both semantic capabilities and executable scheduling guarantees.
@@ -563,6 +584,10 @@ mod tests {
             Ok(())
         }
 
+        fn cancel_wait(&self, _task: TaskId) -> Result<WaitCancellationOutcome, Error> {
+            Ok(WaitCancellationOutcome::NotWaiting)
+        }
+
         fn lock_scheduler(&self) -> Result<(), Error> {
             Ok(())
         }
@@ -635,6 +660,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(id.into_raw(), 1);
+        assert_eq!(
+            cancel_wait(id).unwrap(),
+            WaitCancellationOutcome::NotWaiting
+        );
         assert_eq!(current_task().unwrap().into_raw(), 7);
         set_task_priority(id, TaskPriority::new(2).unwrap()).unwrap();
         lock_scheduler().unwrap();

@@ -14,10 +14,11 @@ adapters translate only the vendor symbols used by their pinned blob and do not
 turn this crate into a LiteOS compatibility surface.
 
 Before a radio adapter allocates resources it can require a versioned
-`RuntimeContract`. Contract v1 fixes both the capability set and scheduling
-priority semantics: `TaskPriority` accepts 0 through 31, with lower numeric
-values outranking higher values. A backend with the wrong major version or a
-missing capability is rejected before partial radio initialization.
+`RuntimeContract`. Contract v1.1 fixes the capability set, generation-bearing
+resource handles, cancellable waits, and scheduling priority semantics:
+`TaskPriority` accepts 0 through 31, with lower numeric values outranking higher
+values. A backend with the wrong version or a missing capability is rejected
+before partial radio initialization.
 
 Scheduling guarantees are advertised separately through a versioned execution
 profile. Port-less cooperative execution is distinct from timer/SWI-backed
@@ -31,10 +32,11 @@ execution profile revision/modes and per-scenario status, and can be emitted as
 allocation-free JSON for CI. The
 suite covers priority/FIFO ordering, nested scheduler-lock deferral, sleep
 deadlines, nested interrupt exit, task exit/slot reuse, semaphore direct
-handoff and timeout cleanup, recursive mutex priority inheritance, and stale
-task identities. It also fixes zero-delay-as-yield, wait-forever, equal-deadline
-FIFO, and highest-priority FIFO semaphore selection. Tick rounding/wrap and the
-RF archive-bound task classification remain separate A5R closure gates.
+handoff and timeout cleanup, recursive mutex priority inheritance, stale task
+and resource identities, busy destroy, and cancellation after a direct grant.
+It also fixes zero-delay-as-yield, wait-forever, equal-deadline FIFO, and
+highest-priority FIFO semaphore selection. Tick rounding/wrap and the RF
+archive-bound task classification remain separate A5R closure gates.
 
 Task-table capacity is distinct from allocator/control-block exhaustion:
 `Runtime::spawn` returns `Error::NoTaskSlots` when no dynamic task slot remains,

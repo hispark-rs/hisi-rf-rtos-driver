@@ -81,6 +81,8 @@ pub struct RuntimeContractVersion {
 impl RuntimeContractVersion {
     /// Contract implemented by this crate release.
     pub const V1_0: Self = Self { major: 1, minor: 0 };
+    /// Adds generation-bearing resource handles and cancellable waits.
+    pub const V1_1: Self = Self { major: 1, minor: 1 };
 
     /// Returns whether this backend version can satisfy `required`.
     pub const fn satisfies(self, required: Self) -> bool {
@@ -106,15 +108,25 @@ impl RuntimeCapabilities {
     pub const SEMAPHORE: Self = Self(1 << 3);
     /// Recursive mutexes with priority inheritance.
     pub const RECURSIVE_PI_MUTEX: Self = Self(1 << 4);
+    /// Opaque synchronization handles reject stale generations and reuse.
+    pub const RESOURCE_HANDLE_GENERATIONS: Self = Self(1 << 5);
+    /// Queued waits and unconsumed direct handoffs can be cancelled safely.
+    pub const WAIT_CANCELLATION: Self = Self(1 << 6);
 
-    /// Complete capability set required by runtime contract v1.
-    pub const V1_REQUIRED: Self = Self(
+    /// Complete capability set required by runtime contract v1.0.
+    pub const V1_0_REQUIRED: Self = Self(
         Self::TASKS.0
             | Self::SCHEDULER_LOCK.0
             | Self::INTERRUPT_WAKE.0
             | Self::SEMAPHORE.0
             | Self::RECURSIVE_PI_MUTEX.0,
     );
+    /// Complete capability set required by runtime contract v1.1.
+    pub const V1_1_REQUIRED: Self = Self(
+        Self::V1_0_REQUIRED.0 | Self::RESOURCE_HANDLE_GENERATIONS.0 | Self::WAIT_CANCELLATION.0,
+    );
+    /// Complete capability set required by the current contract-v1 release.
+    pub const V1_REQUIRED: Self = Self::V1_1_REQUIRED;
 
     /// Creates a capability set from its stable bit representation.
     pub const fn from_bits(bits: u32) -> Self {
@@ -258,9 +270,15 @@ impl RuntimeRequirements {
 }
 
 impl RuntimeContract {
+    /// Original runtime contract without resource generations or cancellation.
+    pub const V1_0: Self = Self {
+        version: RuntimeContractVersion::V1_0,
+        capabilities: RuntimeCapabilities::V1_0_REQUIRED,
+    };
+
     /// Complete runtime contract implemented by current native backends.
     pub const V1: Self = Self {
-        version: RuntimeContractVersion::V1_0,
+        version: RuntimeContractVersion::V1_1,
         capabilities: RuntimeCapabilities::V1_REQUIRED,
     };
 
@@ -288,10 +306,13 @@ mod tests {
     #[test]
     fn version_and_capability_compatibility_fail_closed() {
         let newer_minor = RuntimeContract {
-            version: RuntimeContractVersion { major: 1, minor: 1 },
+            version: RuntimeContractVersion { major: 1, minor: 2 },
             capabilities: RuntimeCapabilities::V1_REQUIRED,
         };
         assert!(newer_minor.satisfies(RuntimeContract::V1));
+
+        assert!(!RuntimeContract::V1_0.satisfies(RuntimeContract::V1));
+        assert!(RuntimeContract::V1.satisfies(RuntimeContract::V1_0));
 
         let wrong_major = RuntimeContract {
             version: RuntimeContractVersion { major: 2, minor: 0 },
@@ -300,13 +321,22 @@ mod tests {
         assert!(!wrong_major.satisfies(RuntimeContract::V1));
 
         let missing_mutex = RuntimeContract {
-            version: RuntimeContractVersion::V1_0,
+            version: RuntimeContractVersion::V1_1,
             capabilities: RuntimeCapabilities::from_bits(
                 RuntimeCapabilities::V1_REQUIRED.bits()
                     & !RuntimeCapabilities::RECURSIVE_PI_MUTEX.bits(),
             ),
         };
         assert!(!missing_mutex.satisfies(RuntimeContract::V1));
+
+        let missing_cancellation = RuntimeContract {
+            version: RuntimeContractVersion::V1_1,
+            capabilities: RuntimeCapabilities::from_bits(
+                RuntimeCapabilities::V1_REQUIRED.bits()
+                    & !RuntimeCapabilities::WAIT_CANCELLATION.bits(),
+            ),
+        };
+        assert!(!missing_cancellation.satisfies(RuntimeContract::V1));
     }
 
     #[test]

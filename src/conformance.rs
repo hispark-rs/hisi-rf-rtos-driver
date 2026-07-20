@@ -10,7 +10,7 @@ use core::num::NonZeroU32;
 use crate::{Error, RuntimeContract, RuntimeExecutionProfile, TaskPriority};
 
 /// Version of the conformance scenario and report schema.
-pub const SCHEMA_VERSION: u16 = 5;
+pub const SCHEMA_VERSION: u16 = 6;
 
 /// Logical task identity used only inside deterministic scenarios.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +82,10 @@ pub enum ActionOutcome {
     ResourceHandleRemembered,
     /// A synchronization resource was destroyed.
     ResourceDestroyed,
+    /// A queued wait or unconsumed direct handoff was cancelled.
+    WaitCancelled,
+    /// The selected live task had no cancellable wait or pending grant.
+    NoPendingWait,
     /// Effective priority observed for one actor.
     PriorityObserved(TaskPriority),
     /// The backend rejected an operation before changing observable state.
@@ -214,6 +218,11 @@ pub enum Action {
         /// Current or previously retained handle.
         handle: ResourceHandleRef,
     },
+    /// Cancel one actor's queued wait or unconsumed direct handoff.
+    CancelWait {
+        /// Actor whose pending synchronization operation is cancelled.
+        actor: ActorId,
+    },
 }
 
 /// State returned after applying one action.
@@ -307,6 +316,14 @@ pub enum ScenarioId {
     DuplicateResourceDestroy,
     /// A resource handle is stale after its slot is reused by a new generation.
     StaleResourceHandle,
+    /// A semaphore with a queued waiter cannot be destroyed.
+    SemaphoreBusyDestroy,
+    /// A mutex with a live owner cannot be destroyed.
+    MutexBusyDestroy,
+    /// Cancelling an unconsumed semaphore handoff preserves its count.
+    SemaphoreCancelAfterGrant,
+    /// Cancelling an unconsumed mutex handoff preserves ownership transfer.
+    MutexCancelAfterGrant,
 }
 
 impl ScenarioId {
@@ -331,6 +348,10 @@ impl ScenarioId {
             Self::BlockingInSchedulerLock => "blocking_in_scheduler_lock",
             Self::DuplicateResourceDestroy => "duplicate_resource_destroy",
             Self::StaleResourceHandle => "stale_resource_handle",
+            Self::SemaphoreBusyDestroy => "semaphore_busy_destroy",
+            Self::MutexBusyDestroy => "mutex_busy_destroy",
+            Self::SemaphoreCancelAfterGrant => "semaphore_cancel_after_grant",
+            Self::MutexCancelAfterGrant => "mutex_cancel_after_grant",
         }
     }
 }
@@ -1572,8 +1593,231 @@ const STALE_RESOURCE_HANDLE_STEPS: &[Step] = &[
     },
 ];
 
+const SEMAPHORE_BUSY_DESTROY_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Preemptive,
+            main_priority: TaskPriority::LOWEST,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::CreateResource {
+            kind: ResourceKind::Semaphore,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_A,
+            priority: TaskPriority::new(4).unwrap(),
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::SemaphoreWait {
+            timeout: Wait::Forever,
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::MAIN),
+            subject: Some((ActorId::WORKER_A, ActorState::Blocked)),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::DestroyResource {
+            kind: ResourceKind::Semaphore,
+            handle: ResourceHandleRef::Current,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::Rejected(Error::InvalidContext)),
+            ..ANY
+        },
+    },
+];
+
+const MUTEX_BUSY_DESTROY_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Cooperative,
+            main_priority: TaskPriority::LOWEST,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::CreateResource {
+            kind: ResourceKind::Mutex,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::MutexLock {
+            timeout: Wait::NoWait,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::Acquired),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::DestroyResource {
+            kind: ResourceKind::Mutex,
+            handle: ResourceHandleRef::Current,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::Rejected(Error::InvalidContext)),
+            ..ANY
+        },
+    },
+];
+
+const SEMAPHORE_CANCEL_AFTER_GRANT_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Preemptive,
+            main_priority: TaskPriority::LOWEST,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::CreateResource {
+            kind: ResourceKind::Semaphore,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_A,
+            priority: TaskPriority::new(4).unwrap(),
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::SemaphoreWait {
+            timeout: Wait::Forever,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::SemaphorePost,
+        expected: ExpectedObservation {
+            subject: Some((ActorId::WORKER_A, ActorState::Ready)),
+            outcome: Some(ActionOutcome::Granted),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::DestroyResource {
+            kind: ResourceKind::Semaphore,
+            handle: ResourceHandleRef::Current,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::Rejected(Error::InvalidContext)),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::CancelWait {
+            actor: ActorId::WORKER_A,
+        },
+        expected: ExpectedObservation {
+            subject: Some((ActorId::WORKER_A, ActorState::Ready)),
+            outcome: Some(ActionOutcome::WaitCancelled),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::SemaphoreWait {
+            timeout: Wait::NoWait,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::Acquired),
+            ..ANY
+        },
+    },
+];
+
+const MUTEX_CANCEL_AFTER_GRANT_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Cooperative,
+            main_priority: TaskPriority::new(10).unwrap(),
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::CreateResource {
+            kind: ResourceKind::Mutex,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::MutexLock {
+            timeout: Wait::NoWait,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::Acquired),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::Spawn {
+            actor: ActorId::WORKER_A,
+            priority: TaskPriority::new(4).unwrap(),
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::Yield,
+        expected: ExpectedObservation {
+            running: Some(ActorId::WORKER_A),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::MutexLock {
+            timeout: Wait::Forever,
+        },
+        expected: ExpectedObservation {
+            running: Some(ActorId::MAIN),
+            subject: Some((ActorId::WORKER_A, ActorState::Blocked)),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::MutexUnlock,
+        expected: ExpectedObservation {
+            subject: Some((ActorId::WORKER_A, ActorState::Ready)),
+            outcome: Some(ActionOutcome::Granted),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::CancelWait {
+            actor: ActorId::WORKER_A,
+        },
+        expected: ExpectedObservation {
+            subject: Some((ActorId::WORKER_A, ActorState::Ready)),
+            outcome: Some(ActionOutcome::WaitCancelled),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::MutexLock {
+            timeout: Wait::NoWait,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::Acquired),
+            ..ANY
+        },
+    },
+];
+
 /// Shared scheduler and synchronization semantics required by contract V1.
-pub const V1_SCENARIOS: [Scenario; 18] = [
+pub const V1_SCENARIOS: [Scenario; 22] = [
     Scenario {
         id: ScenarioId::PriorityThenFifo,
         steps: PRIORITY_FIFO_STEPS,
@@ -1645,6 +1889,22 @@ pub const V1_SCENARIOS: [Scenario; 18] = [
     Scenario {
         id: ScenarioId::StaleResourceHandle,
         steps: STALE_RESOURCE_HANDLE_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::SemaphoreBusyDestroy,
+        steps: SEMAPHORE_BUSY_DESTROY_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::MutexBusyDestroy,
+        steps: MUTEX_BUSY_DESTROY_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::SemaphoreCancelAfterGrant,
+        steps: SEMAPHORE_CANCEL_AFTER_GRANT_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::MutexCancelAfterGrant,
+        steps: MUTEX_CANCEL_AFTER_GRANT_STEPS,
     },
 ];
 
