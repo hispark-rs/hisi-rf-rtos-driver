@@ -10,7 +10,7 @@ use core::num::NonZeroU32;
 use crate::{Error, RuntimeContract, RuntimeExecutionProfile, TaskPriority};
 
 /// Version of the conformance scenario and report schema.
-pub const SCHEMA_VERSION: u16 = 4;
+pub const SCHEMA_VERSION: u16 = 5;
 
 /// Logical task identity used only inside deterministic scenarios.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,10 +76,34 @@ pub enum ActionOutcome {
     IdentityRemembered,
     /// A retained identity was correctly rejected after slot reuse.
     StaleIdentityRejected,
+    /// A synchronization resource was created.
+    ResourceCreated,
+    /// A synchronization resource handle was retained for a later operation.
+    ResourceHandleRemembered,
+    /// A synchronization resource was destroyed.
+    ResourceDestroyed,
     /// Effective priority observed for one actor.
     PriorityObserved(TaskPriority),
     /// The backend rejected an operation before changing observable state.
     Rejected(Error),
+}
+
+/// Synchronization resource selected by a lifecycle scenario.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceKind {
+    /// Counting semaphore.
+    Semaphore,
+    /// Recursive priority-inheritance mutex.
+    Mutex,
+}
+
+/// Which generation-bearing resource handle an action uses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceHandleRef {
+    /// The most recently created live handle.
+    Current,
+    /// A handle retained by [`Action::RememberResourceHandle`].
+    Remembered,
 }
 
 /// Timeout mode used by deterministic wait scenarios.
@@ -173,6 +197,23 @@ pub enum Action {
     },
     /// Validate that the retained identity no longer names a live task.
     ValidateRememberedIdentity,
+    /// Create one synchronization resource for lifecycle checks.
+    CreateResource {
+        /// Resource type to create.
+        kind: ResourceKind,
+    },
+    /// Retain the current resource handle and its identity generation.
+    RememberResourceHandle {
+        /// Resource type whose handle is retained.
+        kind: ResourceKind,
+    },
+    /// Destroy the selected synchronization resource handle.
+    DestroyResource {
+        /// Resource type to destroy.
+        kind: ResourceKind,
+        /// Current or previously retained handle.
+        handle: ResourceHandleRef,
+    },
 }
 
 /// State returned after applying one action.
@@ -262,6 +303,10 @@ pub enum ScenarioId {
     UnbalancedInterruptExit,
     /// Blocking operations are rejected while the scheduler is locked.
     BlockingInSchedulerLock,
+    /// Destroying the same resource handle twice fails closed.
+    DuplicateResourceDestroy,
+    /// A resource handle is stale after its slot is reused by a new generation.
+    StaleResourceHandle,
 }
 
 impl ScenarioId {
@@ -284,6 +329,8 @@ impl ScenarioId {
             Self::UnbalancedSchedulerUnlock => "unbalanced_scheduler_unlock",
             Self::UnbalancedInterruptExit => "unbalanced_interrupt_exit",
             Self::BlockingInSchedulerLock => "blocking_in_scheduler_lock",
+            Self::DuplicateResourceDestroy => "duplicate_resource_destroy",
+            Self::StaleResourceHandle => "stale_resource_handle",
         }
     }
 }
@@ -1419,8 +1466,114 @@ const BLOCKING_IN_SCHEDULER_LOCK_STEPS: &[Step] = &[
     },
 ];
 
+const DUPLICATE_RESOURCE_DESTROY_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Cooperative,
+            main_priority: TaskPriority::LOWEST,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::CreateResource {
+            kind: ResourceKind::Semaphore,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::ResourceCreated),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::RememberResourceHandle {
+            kind: ResourceKind::Semaphore,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::ResourceHandleRemembered),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::DestroyResource {
+            kind: ResourceKind::Semaphore,
+            handle: ResourceHandleRef::Current,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::ResourceDestroyed),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::DestroyResource {
+            kind: ResourceKind::Semaphore,
+            handle: ResourceHandleRef::Remembered,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::Rejected(Error::InvalidHandle)),
+            ..ANY
+        },
+    },
+];
+
+const STALE_RESOURCE_HANDLE_STEPS: &[Step] = &[
+    Step {
+        action: Action::Reset {
+            profile: ExecutionProfile::Cooperative,
+            main_priority: TaskPriority::LOWEST,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::CreateResource {
+            kind: ResourceKind::Semaphore,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::RememberResourceHandle {
+            kind: ResourceKind::Semaphore,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::DestroyResource {
+            kind: ResourceKind::Semaphore,
+            handle: ResourceHandleRef::Current,
+        },
+        expected: ANY,
+    },
+    Step {
+        action: Action::CreateResource {
+            kind: ResourceKind::Semaphore,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::ResourceCreated),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::DestroyResource {
+            kind: ResourceKind::Semaphore,
+            handle: ResourceHandleRef::Remembered,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::Rejected(Error::InvalidHandle)),
+            ..ANY
+        },
+    },
+    Step {
+        action: Action::DestroyResource {
+            kind: ResourceKind::Semaphore,
+            handle: ResourceHandleRef::Current,
+        },
+        expected: ExpectedObservation {
+            outcome: Some(ActionOutcome::ResourceDestroyed),
+            ..ANY
+        },
+    },
+];
+
 /// Shared scheduler and synchronization semantics required by contract V1.
-pub const V1_SCENARIOS: [Scenario; 16] = [
+pub const V1_SCENARIOS: [Scenario; 18] = [
     Scenario {
         id: ScenarioId::PriorityThenFifo,
         steps: PRIORITY_FIFO_STEPS,
@@ -1484,6 +1637,14 @@ pub const V1_SCENARIOS: [Scenario; 16] = [
     Scenario {
         id: ScenarioId::BlockingInSchedulerLock,
         steps: BLOCKING_IN_SCHEDULER_LOCK_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::DuplicateResourceDestroy,
+        steps: DUPLICATE_RESOURCE_DESTROY_STEPS,
+    },
+    Scenario {
+        id: ScenarioId::StaleResourceHandle,
+        steps: STALE_RESOURCE_HANDLE_STEPS,
     },
 ];
 
