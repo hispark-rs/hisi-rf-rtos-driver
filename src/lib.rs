@@ -21,6 +21,61 @@ pub use contract::{
     TaskPriority,
 };
 
+/// Advisory snapshot of dynamic task slots owned by the installed runtime.
+///
+/// This is a preflight observation, not a reservation. Another subsystem may
+/// consume slots after the snapshot is returned. A race-free admission path
+/// must use a future owner-bound reservation token whose slots are consumed by
+/// the corresponding spawn operations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskCapacity {
+    dynamic_capacity: usize,
+    dynamic_used: usize,
+}
+
+impl TaskCapacity {
+    /// Builds a valid capacity snapshot.
+    pub const fn new(dynamic_capacity: usize, dynamic_used: usize) -> Option<Self> {
+        if dynamic_used <= dynamic_capacity {
+            Some(Self {
+                dynamic_capacity,
+                dynamic_used,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Total number of dynamic slots in this runtime instance.
+    pub const fn dynamic_capacity(self) -> usize {
+        self.dynamic_capacity
+    }
+
+    /// Dynamic slots occupied by live tasks at snapshot time.
+    pub const fn dynamic_used(self) -> usize {
+        self.dynamic_used
+    }
+
+    /// Dynamic slots available at snapshot time.
+    pub const fn dynamic_available(self) -> usize {
+        self.dynamic_capacity - self.dynamic_used
+    }
+}
+
+/// Failure to satisfy an advisory task-capacity preflight.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskAdmissionError {
+    /// Runtime discovery or capacity reporting failed.
+    Runtime(Error),
+    /// The snapshot did not contain enough free dynamic slots.
+    InsufficientTaskSlots {
+        /// Slots required by the selected radio profile.
+        required: usize,
+        /// Slots free when the snapshot was taken.
+        available: usize,
+    },
+}
+
 /// Entry point used by a vendor-compatible task.
 pub type TaskEntry = extern "C" fn(*mut c_void) -> *mut c_void;
 
@@ -174,6 +229,15 @@ pub trait Runtime: Sync {
     /// Describes scheduling modes backed by the installed target resources.
     fn execution_profile(&self) -> RuntimeExecutionProfile;
 
+    /// Returns an advisory snapshot of dynamic task capacity.
+    ///
+    /// Backends advertising [`RuntimeCapabilities::TASK_CAPACITY_QUERY`] must
+    /// override this method. The default preserves source compatibility for
+    /// older v1.1 backends.
+    fn task_capacity(&self) -> Result<TaskCapacity, Error> {
+        Err(Error::IncompatibleContract)
+    }
+
     /// Spawns one task.
     fn spawn(
         &self,
@@ -304,6 +368,37 @@ pub fn runtime_contract() -> Result<RuntimeContract, Error> {
 /// Returns scheduling guarantees backed by the installed target resources.
 pub fn runtime_execution_profile() -> Result<RuntimeExecutionProfile, Error> {
     with_runtime(|runtime| Ok(runtime.execution_profile()))
+}
+
+/// Returns an advisory snapshot of the installed runtime's dynamic task slots.
+pub fn task_capacity() -> Result<TaskCapacity, Error> {
+    with_runtime(|runtime| {
+        if !runtime
+            .contract()
+            .capabilities
+            .contains(RuntimeCapabilities::TASK_CAPACITY_QUERY)
+        {
+            return Err(Error::IncompatibleContract);
+        }
+        runtime.task_capacity()
+    })
+}
+
+/// Checks whether a capacity snapshot can accommodate `required` tasks.
+///
+/// This catches deterministic under-provisioning before radio state is
+/// consumed. It does not reserve the observed slots; callers requiring atomic
+/// admission must use the future owner-bound reservation API instead.
+pub fn require_task_capacity(required: usize) -> Result<TaskCapacity, TaskAdmissionError> {
+    let snapshot = task_capacity().map_err(TaskAdmissionError::Runtime)?;
+    let available = snapshot.dynamic_available();
+    if available < required {
+        return Err(TaskAdmissionError::InsufficientTaskSlots {
+            required,
+            available,
+        });
+    }
+    Ok(snapshot)
 }
 
 /// Proves that the installed backend satisfies an adapter's requirements.
@@ -552,11 +647,15 @@ mod tests {
 
     impl Runtime for TestRuntime {
         fn contract(&self) -> RuntimeContract {
-            RuntimeContract::V1
+            RuntimeContract::V1_2
         }
 
         fn execution_profile(&self) -> RuntimeExecutionProfile {
             RuntimeExecutionProfile::V1_PORTED
+        }
+
+        fn task_capacity(&self) -> Result<TaskCapacity, Error> {
+            Ok(TaskCapacity::new(15, 2).unwrap())
         }
 
         fn spawn(
@@ -684,21 +783,32 @@ mod tests {
         );
         mutex_unlock(mutex).unwrap();
         unsafe { mutex_destroy(mutex).unwrap() };
-        assert_eq!(runtime_contract().unwrap(), RuntimeContract::V1);
+        assert_eq!(runtime_contract().unwrap(), RuntimeContract::V1_2);
         assert_eq!(
             runtime_execution_profile().unwrap(),
             RuntimeExecutionProfile::V1_PORTED
         );
         assert_eq!(
             require_runtime_contract(RuntimeContract::V1).unwrap(),
-            RuntimeContract::V1
+            RuntimeContract::V1_2
         );
         assert_eq!(
             require_runtime(RuntimeRequirements::V1_PORTED_COOPERATIVE).unwrap(),
             RuntimeRequirements {
-                contract: RuntimeContract::V1,
+                contract: RuntimeContract::V1_2,
                 execution_profile: RuntimeExecutionProfile::V1_PORTED,
             }
+        );
+        assert_eq!(task_capacity().unwrap().dynamic_capacity(), 15);
+        assert_eq!(task_capacity().unwrap().dynamic_used(), 2);
+        assert_eq!(task_capacity().unwrap().dynamic_available(), 13);
+        assert_eq!(require_task_capacity(13), Ok(task_capacity().unwrap()));
+        assert_eq!(
+            require_task_capacity(14),
+            Err(TaskAdmissionError::InsufficientTaskSlots {
+                required: 14,
+                available: 13,
+            })
         );
     }
 
@@ -719,5 +829,12 @@ mod tests {
             }),
             Err(Error::IncompatibleExecutionProfile)
         );
+    }
+
+    #[test]
+    fn task_capacity_rejects_invalid_snapshots() {
+        assert_eq!(TaskCapacity::new(2, 3), None);
+        let empty = TaskCapacity::new(0, 0).unwrap();
+        assert_eq!(empty.dynamic_available(), 0);
     }
 }

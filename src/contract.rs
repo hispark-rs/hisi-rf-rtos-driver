@@ -83,6 +83,8 @@ impl RuntimeContractVersion {
     pub const V1_0: Self = Self { major: 1, minor: 0 };
     /// Adds generation-bearing resource handles and cancellable waits.
     pub const V1_1: Self = Self { major: 1, minor: 1 };
+    /// Adds an advisory dynamic-task capacity snapshot.
+    pub const V1_2: Self = Self { major: 1, minor: 2 };
 
     /// Returns whether this backend version can satisfy `required`.
     pub const fn satisfies(self, required: Self) -> bool {
@@ -112,6 +114,8 @@ impl RuntimeCapabilities {
     pub const RESOURCE_HANDLE_GENERATIONS: Self = Self(1 << 5);
     /// Queued waits and unconsumed direct handoffs can be cancelled safely.
     pub const WAIT_CANCELLATION: Self = Self(1 << 6);
+    /// Dynamic task capacity can be queried before radio initialization.
+    pub const TASK_CAPACITY_QUERY: Self = Self(1 << 7);
 
     /// Complete capability set required by runtime contract v1.0.
     pub const V1_0_REQUIRED: Self = Self(
@@ -125,8 +129,12 @@ impl RuntimeCapabilities {
     pub const V1_1_REQUIRED: Self = Self(
         Self::V1_0_REQUIRED.0 | Self::RESOURCE_HANDLE_GENERATIONS.0 | Self::WAIT_CANCELLATION.0,
     );
-    /// Complete capability set required by the current contract-v1 release.
-    pub const V1_REQUIRED: Self = Self::V1_1_REQUIRED;
+    /// Complete capability set required by runtime contract v1.2.
+    pub const V1_2_REQUIRED: Self = Self(Self::V1_1_REQUIRED.0 | Self::TASK_CAPACITY_QUERY.0);
+    /// Minimum capability set accepted when installing a runtime.
+    pub const V1_MINIMUM: Self = Self::V1_1_REQUIRED;
+    /// Complete capability set implemented by the current native backend.
+    pub const V1_CURRENT: Self = Self::V1_2_REQUIRED;
 
     /// Creates a capability set from its stable bit representation.
     pub const fn from_bits(bits: u32) -> Self {
@@ -276,10 +284,16 @@ impl RuntimeContract {
         capabilities: RuntimeCapabilities::V1_0_REQUIRED,
     };
 
-    /// Complete runtime contract implemented by current native backends.
+    /// Runtime contract v1.1, retained for compatibility with existing adapters.
     pub const V1: Self = Self {
         version: RuntimeContractVersion::V1_1,
-        capabilities: RuntimeCapabilities::V1_REQUIRED,
+        capabilities: RuntimeCapabilities::V1_1_REQUIRED,
+    };
+
+    /// Runtime contract v1.2 with advisory task-capacity queries.
+    pub const V1_2: Self = Self {
+        version: RuntimeContractVersion::V1_2,
+        capabilities: RuntimeCapabilities::V1_2_REQUIRED,
     };
 
     /// Returns whether this backend satisfies `required`.
@@ -307,7 +321,7 @@ mod tests {
     fn version_and_capability_compatibility_fail_closed() {
         let newer_minor = RuntimeContract {
             version: RuntimeContractVersion { major: 1, minor: 2 },
-            capabilities: RuntimeCapabilities::V1_REQUIRED,
+            capabilities: RuntimeCapabilities::V1_2_REQUIRED,
         };
         assert!(newer_minor.satisfies(RuntimeContract::V1));
 
@@ -316,14 +330,14 @@ mod tests {
 
         let wrong_major = RuntimeContract {
             version: RuntimeContractVersion { major: 2, minor: 0 },
-            capabilities: RuntimeCapabilities::V1_REQUIRED,
+            capabilities: RuntimeCapabilities::V1_2_REQUIRED,
         };
         assert!(!wrong_major.satisfies(RuntimeContract::V1));
 
         let missing_mutex = RuntimeContract {
             version: RuntimeContractVersion::V1_1,
             capabilities: RuntimeCapabilities::from_bits(
-                RuntimeCapabilities::V1_REQUIRED.bits()
+                RuntimeCapabilities::V1_1_REQUIRED.bits()
                     & !RuntimeCapabilities::RECURSIVE_PI_MUTEX.bits(),
             ),
         };
@@ -332,11 +346,14 @@ mod tests {
         let missing_cancellation = RuntimeContract {
             version: RuntimeContractVersion::V1_1,
             capabilities: RuntimeCapabilities::from_bits(
-                RuntimeCapabilities::V1_REQUIRED.bits()
+                RuntimeCapabilities::V1_1_REQUIRED.bits()
                     & !RuntimeCapabilities::WAIT_CANCELLATION.bits(),
             ),
         };
         assert!(!missing_cancellation.satisfies(RuntimeContract::V1));
+
+        assert!(RuntimeContract::V1_2.satisfies(RuntimeContract::V1));
+        assert!(!RuntimeContract::V1.satisfies(RuntimeContract::V1_2));
     }
 
     #[test]

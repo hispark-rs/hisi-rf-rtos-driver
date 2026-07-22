@@ -20,6 +20,12 @@ resource handles, cancellable waits, and scheduling priority semantics:
 values. A backend with the wrong version or a missing capability is rejected
 before partial radio initialization.
 
+Contract v1.2 adds an advisory dynamic-task capacity snapshot. Radio profiles
+can reject deterministic under-provisioning before consuming their storage, but
+the snapshot is deliberately not called a reservation: another subsystem can
+spawn between the check and radio startup. Race-free admission remains a future
+owner-bound reservation whose token is consumed by the corresponding spawns.
+
 Scheduling guarantees are advertised separately through a versioned execution
 profile. Port-less cooperative execution is distinct from timer/SWI-backed
 cooperative, budgeted, and preemptive modes, so adapters can fail before
