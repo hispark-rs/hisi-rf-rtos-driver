@@ -31,6 +31,7 @@ pub use contract::{
 pub struct TaskCapacity {
     dynamic_capacity: usize,
     dynamic_used: usize,
+    dynamic_reserved: usize,
 }
 
 impl TaskCapacity {
@@ -40,6 +41,24 @@ impl TaskCapacity {
             Some(Self {
                 dynamic_capacity,
                 dynamic_used,
+                dynamic_reserved: 0,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Builds a snapshot that also accounts for unconsumed reservations.
+    pub const fn new_with_reserved(
+        dynamic_capacity: usize,
+        dynamic_used: usize,
+        dynamic_reserved: usize,
+    ) -> Option<Self> {
+        if dynamic_used <= dynamic_capacity && dynamic_reserved <= dynamic_capacity - dynamic_used {
+            Some(Self {
+                dynamic_capacity,
+                dynamic_used,
+                dynamic_reserved,
             })
         } else {
             None
@@ -56,9 +75,38 @@ impl TaskCapacity {
         self.dynamic_used
     }
 
+    /// Dynamic slots promised to live reservation tokens but not yet consumed.
+    pub const fn dynamic_reserved(self) -> usize {
+        self.dynamic_reserved
+    }
+
     /// Dynamic slots available at snapshot time.
     pub const fn dynamic_available(self) -> usize {
-        self.dynamic_capacity - self.dynamic_used
+        self.dynamic_capacity - self.dynamic_used - self.dynamic_reserved
+    }
+}
+
+/// Opaque owner-bound reservation for dynamic task slots.
+///
+/// The token is intentionally not `Copy` or `Clone`. A runtime validates its
+/// generation on every operation; releasing it invalidates subsequent spawns.
+#[derive(Debug, Eq, PartialEq)]
+#[must_use = "a task reservation must be retained until its reserved spawns finish"]
+pub struct TaskReservation(NonZeroU32);
+
+impl TaskReservation {
+    /// Creates a token from a runtime-owned generation-bearing identity.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must identify a live reservation owned by the implementing runtime.
+    pub const unsafe fn from_raw(raw: NonZeroU32) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the runtime-owned opaque identity.
+    pub const fn into_raw(&self) -> NonZeroU32 {
+        self.0
     }
 }
 
@@ -238,6 +286,30 @@ pub trait Runtime: Sync {
         Err(Error::IncompatibleContract)
     }
 
+    /// Atomically reserves dynamic task slots for one subsystem owner.
+    fn reserve_tasks(
+        &self,
+        _required: NonZeroUsize,
+    ) -> Result<TaskReservation, TaskAdmissionError> {
+        Err(TaskAdmissionError::Runtime(Error::IncompatibleContract))
+    }
+
+    /// Releases the still-unconsumed slots held by a reservation.
+    fn release_task_reservation(&self, _reservation: &TaskReservation) -> Result<(), Error> {
+        Err(Error::IncompatibleContract)
+    }
+
+    /// Spawns one task while consuming a slot from `reservation`.
+    fn spawn_reserved(
+        &self,
+        _reservation: &TaskReservation,
+        _entry: TaskEntry,
+        _arg: *mut c_void,
+        _config: TaskConfig,
+    ) -> Result<TaskId, Error> {
+        Err(Error::IncompatibleContract)
+    }
+
     /// Spawns one task.
     fn spawn(
         &self,
@@ -401,6 +473,27 @@ pub fn require_task_capacity(required: usize) -> Result<TaskCapacity, TaskAdmiss
     Ok(snapshot)
 }
 
+/// Atomically reserves `required` dynamic slots before radio initialization.
+pub fn reserve_task_capacity(
+    required: NonZeroUsize,
+) -> Result<TaskReservation, TaskAdmissionError> {
+    with_runtime_admission(|runtime| {
+        if !runtime
+            .contract()
+            .capabilities
+            .contains(RuntimeCapabilities::TASK_RESERVATION)
+        {
+            return Err(TaskAdmissionError::Runtime(Error::IncompatibleContract));
+        }
+        runtime.reserve_tasks(required)
+    })
+}
+
+/// Releases the unconsumed portion of a task reservation.
+pub fn release_task_reservation(reservation: &TaskReservation) -> Result<(), Error> {
+    with_runtime(|runtime| runtime.release_task_reservation(reservation))
+}
+
 /// Proves that the installed backend satisfies an adapter's requirements.
 ///
 /// Radio adapters should call this before allocating tasks or publishing
@@ -444,9 +537,27 @@ fn with_runtime<T>(operation: impl FnOnce(&dyn Runtime) -> Result<T, Error>) -> 
     operation(runtime.ok_or(Error::NotInstalled)?)
 }
 
+fn with_runtime_admission<T>(
+    operation: impl FnOnce(&dyn Runtime) -> Result<T, TaskAdmissionError>,
+) -> Result<T, TaskAdmissionError> {
+    let runtime = critical_section::with(|cs| RUNTIME.borrow(cs).get())
+        .ok_or(TaskAdmissionError::Runtime(Error::NotInstalled))?;
+    operation(runtime)
+}
+
 /// Spawns a task through the installed runtime.
 pub fn spawn(entry: TaskEntry, arg: *mut c_void, config: TaskConfig) -> Result<TaskId, Error> {
     with_runtime(|runtime| runtime.spawn(entry, arg, config))
+}
+
+/// Spawns a task while consuming one slot from an owner-bound reservation.
+pub fn spawn_reserved(
+    reservation: &TaskReservation,
+    entry: TaskEntry,
+    arg: *mut c_void,
+    config: TaskConfig,
+) -> Result<TaskId, Error> {
+    with_runtime(|runtime| runtime.spawn_reserved(reservation, entry, arg, config))
 }
 
 /// Yields through the installed runtime.
@@ -647,7 +758,7 @@ mod tests {
 
     impl Runtime for TestRuntime {
         fn contract(&self) -> RuntimeContract {
-            RuntimeContract::V1_2
+            RuntimeContract::V1_3
         }
 
         fn execution_profile(&self) -> RuntimeExecutionProfile {
@@ -656,6 +767,33 @@ mod tests {
 
         fn task_capacity(&self) -> Result<TaskCapacity, Error> {
             Ok(TaskCapacity::new(15, 2).unwrap())
+        }
+
+        fn reserve_tasks(
+            &self,
+            required: NonZeroUsize,
+        ) -> Result<TaskReservation, TaskAdmissionError> {
+            if required.get() > 13 {
+                return Err(TaskAdmissionError::InsufficientTaskSlots {
+                    required: required.get(),
+                    available: 13,
+                });
+            }
+            Ok(unsafe { TaskReservation::from_raw(NonZeroU32::new(1).unwrap()) })
+        }
+
+        fn release_task_reservation(&self, _reservation: &TaskReservation) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn spawn_reserved(
+            &self,
+            _reservation: &TaskReservation,
+            entry: TaskEntry,
+            arg: *mut c_void,
+            config: TaskConfig,
+        ) -> Result<TaskId, Error> {
+            self.spawn(entry, arg, config)
         }
 
         fn spawn(
@@ -783,19 +921,19 @@ mod tests {
         );
         mutex_unlock(mutex).unwrap();
         unsafe { mutex_destroy(mutex).unwrap() };
-        assert_eq!(runtime_contract().unwrap(), RuntimeContract::V1_2);
+        assert_eq!(runtime_contract().unwrap(), RuntimeContract::V1_3);
         assert_eq!(
             runtime_execution_profile().unwrap(),
             RuntimeExecutionProfile::V1_PORTED
         );
         assert_eq!(
             require_runtime_contract(RuntimeContract::V1).unwrap(),
-            RuntimeContract::V1_2
+            RuntimeContract::V1_3
         );
         assert_eq!(
             require_runtime(RuntimeRequirements::V1_PORTED_COOPERATIVE).unwrap(),
             RuntimeRequirements {
-                contract: RuntimeContract::V1_2,
+                contract: RuntimeContract::V1_3,
                 execution_profile: RuntimeExecutionProfile::V1_PORTED,
             }
         );
@@ -810,6 +948,20 @@ mod tests {
                 available: 13,
             })
         );
+        let reservation = reserve_task_capacity(NonZeroUsize::new(3).unwrap()).unwrap();
+        assert_eq!(reservation.into_raw(), NonZeroU32::new(1).unwrap());
+        let reserved_task = spawn_reserved(
+            &reservation,
+            task,
+            core::ptr::null_mut(),
+            TaskConfig {
+                stack_size: NonZeroUsize::new(1024).unwrap(),
+                priority: TaskPriority::new(3).unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(reserved_task.into_raw(), 2);
+        release_task_reservation(&reservation).unwrap();
     }
 
     #[test]
@@ -836,5 +988,9 @@ mod tests {
         assert_eq!(TaskCapacity::new(2, 3), None);
         let empty = TaskCapacity::new(0, 0).unwrap();
         assert_eq!(empty.dynamic_available(), 0);
+        let reserved = TaskCapacity::new_with_reserved(15, 2, 5).unwrap();
+        assert_eq!(reserved.dynamic_reserved(), 5);
+        assert_eq!(reserved.dynamic_available(), 8);
+        assert_eq!(TaskCapacity::new_with_reserved(15, 12, 4), None);
     }
 }

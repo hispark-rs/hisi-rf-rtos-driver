@@ -23,8 +23,13 @@ before partial radio initialization.
 Contract v1.2 adds an advisory dynamic-task capacity snapshot. Radio profiles
 can reject deterministic under-provisioning before consuming their storage, but
 the snapshot is deliberately not called a reservation: another subsystem can
-spawn between the check and radio startup. Race-free admission remains a future
-owner-bound reservation whose token is consumed by the corresponding spawns.
+spawn between the check and radio startup.
+
+Contract v1.3 adds race-free, owner-bound task admission. A profile atomically
+reserves a non-zero number of dynamic slots, retains the opaque generation-
+bearing `TaskReservation`, and uses `spawn_reserved` for the corresponding
+tasks. Ordinary `spawn` cannot consume unfilled reservations; releasing a token
+returns only its unconsumed slots, and stale or exhausted tokens fail closed.
 
 Scheduling guarantees are advertised separately through a versioned execution
 profile. Port-less cooperative execution is distinct from timer/SWI-backed
