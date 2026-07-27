@@ -31,6 +31,12 @@ bearing `TaskReservation`, and uses `spawn_reserved` for the corresponding
 tasks. Ordinary `spawn` cannot consume unfilled reservations; releasing a token
 returns only its unconsumed slots, and stale or exhausted tokens fail closed.
 
+Contract v1.4 extends the same owner-bound token to task-stack admission.
+`reserve_task_resources` atomically promises dynamic slots and one fixed-size
+stack allocation per slot. Partial allocation or slot-reservation failure rolls
+back every stack before the token becomes visible; releasing the token returns
+only unconsumed stacks and slots.
+
 Scheduling guarantees are advertised separately through a versioned execution
 profile. Port-less cooperative execution is distinct from timer/SWI-backed
 cooperative, budgeted, and preemptive modes, so adapters can fail before

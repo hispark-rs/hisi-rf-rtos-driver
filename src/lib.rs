@@ -21,12 +21,11 @@ pub use contract::{
     TaskPriority,
 };
 
-/// Advisory snapshot of dynamic task slots owned by the installed runtime.
+/// Snapshot of dynamic task slots owned by the installed runtime.
 ///
 /// This is a preflight observation, not a reservation. Another subsystem may
-/// consume slots after the snapshot is returned. A race-free admission path
-/// must use a future owner-bound reservation token whose slots are consumed by
-/// the corresponding spawn operations.
+/// consume slots after the snapshot is returned. Race-free admission uses an
+/// owner-bound reservation token consumed by corresponding spawn operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskCapacity {
     dynamic_capacity: usize,
@@ -110,7 +109,46 @@ impl TaskReservation {
     }
 }
 
-/// Failure to satisfy an advisory task-capacity preflight.
+/// Atomic task-slot and stack-memory requirements for one subsystem owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskResourceRequirements {
+    task_slots: NonZeroUsize,
+    stack_bytes_per_task: NonZeroUsize,
+}
+
+impl TaskResourceRequirements {
+    /// Construct a checked task-resource request.
+    pub const fn new(task_slots: NonZeroUsize, stack_bytes_per_task: NonZeroUsize) -> Option<Self> {
+        if task_slots
+            .get()
+            .checked_mul(stack_bytes_per_task.get())
+            .is_none()
+        {
+            return None;
+        }
+        Some(Self {
+            task_slots,
+            stack_bytes_per_task,
+        })
+    }
+
+    /// Dynamic task slots required by the owner.
+    pub const fn task_slots(self) -> NonZeroUsize {
+        self.task_slots
+    }
+
+    /// Stack bytes reserved for each task.
+    pub const fn stack_bytes_per_task(self) -> NonZeroUsize {
+        self.stack_bytes_per_task
+    }
+
+    /// Total task-stack bytes reserved by this request.
+    pub const fn total_stack_bytes(self) -> usize {
+        self.task_slots.get() * self.stack_bytes_per_task.get()
+    }
+}
+
+/// Failure to satisfy task-resource admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskAdmissionError {
     /// Runtime discovery or capacity reporting failed.
@@ -120,6 +158,13 @@ pub enum TaskAdmissionError {
         /// Slots required by the selected radio profile.
         required: usize,
         /// Slots free when the snapshot was taken.
+        available: usize,
+    },
+    /// The runtime could not reserve every requested task stack.
+    InsufficientTaskStackMemory {
+        /// Total stack bytes required by the selected profile.
+        required: usize,
+        /// Bytes successfully reserved before allocation failed.
         available: usize,
     },
 }
@@ -294,6 +339,14 @@ pub trait Runtime: Sync {
         Err(TaskAdmissionError::Runtime(Error::IncompatibleContract))
     }
 
+    /// Atomically reserves dynamic task slots and their stack allocations.
+    fn reserve_task_resources(
+        &self,
+        _required: TaskResourceRequirements,
+    ) -> Result<TaskReservation, TaskAdmissionError> {
+        Err(TaskAdmissionError::Runtime(Error::IncompatibleContract))
+    }
+
     /// Releases the still-unconsumed slots held by a reservation.
     fn release_task_reservation(&self, _reservation: &TaskReservation) -> Result<(), Error> {
         Err(Error::IncompatibleContract)
@@ -460,7 +513,7 @@ pub fn task_capacity() -> Result<TaskCapacity, Error> {
 ///
 /// This catches deterministic under-provisioning before radio state is
 /// consumed. It does not reserve the observed slots; callers requiring atomic
-/// admission must use the future owner-bound reservation API instead.
+/// admission must use [`reserve_task_capacity`] or [`reserve_task_resources`].
 pub fn require_task_capacity(required: usize) -> Result<TaskCapacity, TaskAdmissionError> {
     let snapshot = task_capacity().map_err(TaskAdmissionError::Runtime)?;
     let available = snapshot.dynamic_available();
@@ -486,6 +539,22 @@ pub fn reserve_task_capacity(
             return Err(TaskAdmissionError::Runtime(Error::IncompatibleContract));
         }
         runtime.reserve_tasks(required)
+    })
+}
+
+/// Atomically reserves dynamic task slots and one stack allocation per slot.
+pub fn reserve_task_resources(
+    required: TaskResourceRequirements,
+) -> Result<TaskReservation, TaskAdmissionError> {
+    with_runtime_admission(|runtime| {
+        if !runtime
+            .contract()
+            .capabilities
+            .contains(RuntimeCapabilities::TASK_STACK_RESERVATION)
+        {
+            return Err(TaskAdmissionError::Runtime(Error::IncompatibleContract));
+        }
+        runtime.reserve_task_resources(required)
     })
 }
 
@@ -992,5 +1061,24 @@ mod tests {
         assert_eq!(reserved.dynamic_reserved(), 5);
         assert_eq!(reserved.dynamic_available(), 8);
         assert_eq!(TaskCapacity::new_with_reserved(15, 12, 4), None);
+    }
+
+    #[test]
+    fn task_resource_requirements_reject_overflow_and_report_exact_bytes() {
+        let requirements = TaskResourceRequirements::new(
+            NonZeroUsize::new(6).unwrap(),
+            NonZeroUsize::new(24 * 1024).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(requirements.task_slots().get(), 6);
+        assert_eq!(requirements.stack_bytes_per_task().get(), 24 * 1024);
+        assert_eq!(requirements.total_stack_bytes(), 144 * 1024);
+        assert_eq!(
+            TaskResourceRequirements::new(
+                NonZeroUsize::new(usize::MAX).unwrap(),
+                NonZeroUsize::new(2).unwrap(),
+            ),
+            None
+        );
     }
 }

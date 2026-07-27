@@ -87,6 +87,8 @@ impl RuntimeContractVersion {
     pub const V1_2: Self = Self { major: 1, minor: 2 };
     /// Adds owner-bound dynamic-task reservations consumed by task creation.
     pub const V1_3: Self = Self { major: 1, minor: 3 };
+    /// Adds atomic task-slot and stack-memory reservations.
+    pub const V1_4: Self = Self { major: 1, minor: 4 };
 
     /// Returns whether this backend version can satisfy `required`.
     pub const fn satisfies(self, required: Self) -> bool {
@@ -120,6 +122,8 @@ impl RuntimeCapabilities {
     pub const TASK_CAPACITY_QUERY: Self = Self(1 << 7);
     /// Dynamic task slots can be reserved before radio initialization.
     pub const TASK_RESERVATION: Self = Self(1 << 8);
+    /// Task stacks can be allocated atomically with dynamic-slot admission.
+    pub const TASK_STACK_RESERVATION: Self = Self(1 << 9);
 
     /// Complete capability set required by runtime contract v1.0.
     pub const V1_0_REQUIRED: Self = Self(
@@ -137,10 +141,12 @@ impl RuntimeCapabilities {
     pub const V1_2_REQUIRED: Self = Self(Self::V1_1_REQUIRED.0 | Self::TASK_CAPACITY_QUERY.0);
     /// Complete capability set required by runtime contract v1.3.
     pub const V1_3_REQUIRED: Self = Self(Self::V1_2_REQUIRED.0 | Self::TASK_RESERVATION.0);
+    /// Complete capability set required by runtime contract v1.4.
+    pub const V1_4_REQUIRED: Self = Self(Self::V1_3_REQUIRED.0 | Self::TASK_STACK_RESERVATION.0);
     /// Minimum capability set accepted when installing a runtime.
     pub const V1_MINIMUM: Self = Self::V1_1_REQUIRED;
     /// Complete capability set implemented by the current native backend.
-    pub const V1_CURRENT: Self = Self::V1_3_REQUIRED;
+    pub const V1_CURRENT: Self = Self::V1_4_REQUIRED;
 
     /// Creates a capability set from its stable bit representation.
     pub const fn from_bits(bits: u32) -> Self {
@@ -287,6 +293,12 @@ impl RuntimeRequirements {
         contract: RuntimeContract::V1_3,
         execution_profile: RuntimeExecutionProfile::V1_PORTED_COOPERATIVE,
     };
+
+    /// Contract v1.4 with atomic task-stack admission and ported cooperative execution.
+    pub const V1_4_PORTED_COOPERATIVE: Self = Self {
+        contract: RuntimeContract::V1_4,
+        execution_profile: RuntimeExecutionProfile::V1_PORTED_COOPERATIVE,
+    };
 }
 
 impl RuntimeContract {
@@ -312,6 +324,12 @@ impl RuntimeContract {
     pub const V1_3: Self = Self {
         version: RuntimeContractVersion::V1_3,
         capabilities: RuntimeCapabilities::V1_3_REQUIRED,
+    };
+
+    /// Runtime contract v1.4 with owner-bound task-stack reservations.
+    pub const V1_4: Self = Self {
+        version: RuntimeContractVersion::V1_4,
+        capabilities: RuntimeCapabilities::V1_4_REQUIRED,
     };
 
     /// Returns whether this backend satisfies `required`.
