@@ -238,6 +238,58 @@ pub struct TaskConfig {
     pub priority: TaskPriority,
 }
 
+/// Periodic CPU quota for one runtime task, expressed in milliseconds.
+///
+/// This is an upper bound enforced by a target-backed scheduler. It does not
+/// promise that the task receives `capacity_ms` in every period.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskBudget {
+    capacity_ms: NonZeroU32,
+    replenishment_period_ms: NonZeroU32,
+}
+
+impl TaskBudget {
+    /// Creates a quota whose capacity does not exceed its replenishment period.
+    pub const fn try_new(
+        capacity_ms: NonZeroU32,
+        replenishment_period_ms: NonZeroU32,
+    ) -> Option<Self> {
+        if capacity_ms.get() <= replenishment_period_ms.get() {
+            Some(Self {
+                capacity_ms,
+                replenishment_period_ms,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Maximum CPU time available in one replenishment period.
+    pub const fn capacity_ms(self) -> NonZeroU32 {
+        self.capacity_ms
+    }
+
+    /// Period at which the CPU quota is replenished.
+    pub const fn replenishment_period_ms(self) -> NonZeroU32 {
+        self.replenishment_period_ms
+    }
+}
+
+/// Execution policy assigned atomically when a runtime task is created.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TaskExecutionPolicy {
+    /// Runs until it yields, blocks, or exits.
+    #[default]
+    Cooperative,
+    /// Runs cooperatively until its periodic CPU quota is exhausted.
+    Budgeted(TaskBudget),
+    /// Allows timer-driven equal-priority round-robin preemption.
+    Preemptive {
+        /// Non-zero time slice in milliseconds.
+        time_slice_ms: NonZeroU32,
+    },
+}
+
 /// A bounded or unbounded wait request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WaitTimeout {
@@ -363,6 +415,19 @@ pub trait Runtime: Sync {
         Err(Error::IncompatibleContract)
     }
 
+    /// Spawns a reserved task with its execution policy installed before it
+    /// becomes eligible to run.
+    fn spawn_reserved_scheduled(
+        &self,
+        _reservation: &TaskReservation,
+        _entry: TaskEntry,
+        _arg: *mut c_void,
+        _config: TaskConfig,
+        _policy: TaskExecutionPolicy,
+    ) -> Result<TaskId, Error> {
+        Err(Error::IncompatibleContract)
+    }
+
     /// Spawns one task.
     fn spawn(
         &self,
@@ -370,6 +435,18 @@ pub trait Runtime: Sync {
         arg: *mut c_void,
         config: TaskConfig,
     ) -> Result<TaskId, Error>;
+
+    /// Spawns a task with its execution policy installed before it becomes
+    /// eligible to run.
+    fn spawn_scheduled(
+        &self,
+        _entry: TaskEntry,
+        _arg: *mut c_void,
+        _config: TaskConfig,
+        _policy: TaskExecutionPolicy,
+    ) -> Result<TaskId, Error> {
+        Err(Error::IncompatibleContract)
+    }
 
     /// Makes another ready task eligible to run.
     fn yield_now(&self) -> Result<(), Error>;
@@ -619,6 +696,16 @@ pub fn spawn(entry: TaskEntry, arg: *mut c_void, config: TaskConfig) -> Result<T
     with_runtime(|runtime| runtime.spawn(entry, arg, config))
 }
 
+/// Spawns a task with an explicit execution policy assigned atomically.
+pub fn spawn_scheduled(
+    entry: TaskEntry,
+    arg: *mut c_void,
+    config: TaskConfig,
+    policy: TaskExecutionPolicy,
+) -> Result<TaskId, Error> {
+    with_runtime(|runtime| runtime.spawn_scheduled(entry, arg, config, policy))
+}
+
 /// Spawns a task while consuming one slot from an owner-bound reservation.
 pub fn spawn_reserved(
     reservation: &TaskReservation,
@@ -627,6 +714,19 @@ pub fn spawn_reserved(
     config: TaskConfig,
 ) -> Result<TaskId, Error> {
     with_runtime(|runtime| runtime.spawn_reserved(reservation, entry, arg, config))
+}
+
+/// Spawns a reserved task with an explicit execution policy assigned atomically.
+pub fn spawn_reserved_scheduled(
+    reservation: &TaskReservation,
+    entry: TaskEntry,
+    arg: *mut c_void,
+    config: TaskConfig,
+    policy: TaskExecutionPolicy,
+) -> Result<TaskId, Error> {
+    with_runtime(|runtime| {
+        runtime.spawn_reserved_scheduled(reservation, entry, arg, config, policy)
+    })
 }
 
 /// Yields through the installed runtime.
@@ -819,7 +919,10 @@ mod tests {
     critical_section::set_impl!(TestCriticalSection);
 
     unsafe impl critical_section::Impl for TestCriticalSection {
-        unsafe fn acquire() -> critical_section::RawRestoreState {}
+        unsafe fn acquire() -> critical_section::RawRestoreState {
+            // SAFETY: the host test implementation never inspects restore state.
+            unsafe { core::mem::zeroed() }
+        }
         unsafe fn release(_: critical_section::RawRestoreState) {}
     }
 
@@ -967,6 +1070,18 @@ mod tests {
         .unwrap();
         assert_eq!(id.into_raw(), 1);
         assert_eq!(
+            spawn_scheduled(
+                task,
+                core::ptr::null_mut(),
+                TaskConfig {
+                    stack_size: NonZeroUsize::new(1024).unwrap(),
+                    priority: TaskPriority::new(3).unwrap(),
+                },
+                TaskExecutionPolicy::Cooperative,
+            ),
+            Err(Error::IncompatibleContract)
+        );
+        assert_eq!(
             cancel_wait(id).unwrap(),
             WaitCancellationOutcome::NotWaiting
         );
@@ -1061,6 +1176,16 @@ mod tests {
         assert_eq!(reserved.dynamic_reserved(), 5);
         assert_eq!(reserved.dynamic_available(), 8);
         assert_eq!(TaskCapacity::new_with_reserved(15, 12, 4), None);
+    }
+
+    #[test]
+    fn task_budget_rejects_capacity_larger_than_period() {
+        let ten = NonZeroU32::new(10).unwrap();
+        let twenty = NonZeroU32::new(20).unwrap();
+        let budget = TaskBudget::try_new(ten, twenty).unwrap();
+        assert_eq!(budget.capacity_ms(), ten);
+        assert_eq!(budget.replenishment_period_ms(), twenty);
+        assert_eq!(TaskBudget::try_new(twenty, ten), None);
     }
 
     #[test]

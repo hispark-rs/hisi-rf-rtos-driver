@@ -37,6 +37,14 @@ stack allocation per slot. Partial allocation or slot-reservation failure rolls
 back every stack before the token becomes visible; releasing the token returns
 only unconsumed stacks and slots.
 
+Contract v1.5 adds atomic per-task execution-policy assignment. A runtime can
+create a task as Cooperative, Budgeted, or Preemptive before that task enters a
+ready queue; adapters never spawn a worker and race to mutate its policy later.
+The budget contract is a periodic CPU upper bound expressed in milliseconds,
+not a minimum-service reservation. Backends without this capability fail
+closed, and budgeted/preemptive requests also require a target-backed execution
+profile.
+
 Scheduling guarantees are advertised separately through a versioned execution
 profile. Port-less cooperative execution is distinct from timer/SWI-backed
 cooperative, budgeted, and preemptive modes, so adapters can fail before
