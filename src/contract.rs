@@ -91,6 +91,8 @@ impl RuntimeContractVersion {
     pub const V1_4: Self = Self { major: 1, minor: 4 };
     /// Adds atomic task creation with an explicit execution policy.
     pub const V1_5: Self = Self { major: 1, minor: 5 };
+    /// Adds atomic admission of multiple independently owned stack groups.
+    pub const V1_6: Self = Self { major: 1, minor: 6 };
 
     /// Returns whether this backend version can satisfy `required`.
     pub const fn satisfies(self, required: Self) -> bool {
@@ -128,6 +130,8 @@ impl RuntimeCapabilities {
     pub const TASK_STACK_RESERVATION: Self = Self(1 << 9);
     /// A task can enter the ready queue with its execution policy already set.
     pub const TASK_EXECUTION_POLICY: Self = Self(1 << 10);
+    /// Multiple heterogeneous task groups can be reserved as one transaction.
+    pub const TASK_RESOURCE_PLAN_RESERVATION: Self = Self(1 << 11);
 
     /// Complete capability set required by runtime contract v1.0.
     pub const V1_0_REQUIRED: Self = Self(
@@ -149,10 +153,13 @@ impl RuntimeCapabilities {
     pub const V1_4_REQUIRED: Self = Self(Self::V1_3_REQUIRED.0 | Self::TASK_STACK_RESERVATION.0);
     /// Complete capability set required by runtime contract v1.5.
     pub const V1_5_REQUIRED: Self = Self(Self::V1_4_REQUIRED.0 | Self::TASK_EXECUTION_POLICY.0);
+    /// Complete capability set required by runtime contract v1.6.
+    pub const V1_6_REQUIRED: Self =
+        Self(Self::V1_5_REQUIRED.0 | Self::TASK_RESOURCE_PLAN_RESERVATION.0);
     /// Minimum capability set accepted when installing a runtime.
     pub const V1_MINIMUM: Self = Self::V1_1_REQUIRED;
     /// Complete capability set implemented by the current native backend.
-    pub const V1_CURRENT: Self = Self::V1_5_REQUIRED;
+    pub const V1_CURRENT: Self = Self::V1_6_REQUIRED;
 
     /// Creates a capability set from its stable bit representation.
     pub const fn from_bits(bits: u32) -> Self {
@@ -317,6 +324,18 @@ impl RuntimeRequirements {
         contract: RuntimeContract::V1_5,
         execution_profile: RuntimeExecutionProfile::V1_BUDGETED,
     };
+
+    /// Contract v1.6 with atomic heterogeneous admission and budgeted execution.
+    pub const V1_6_BUDGETED: Self = Self {
+        contract: RuntimeContract::V1_6,
+        execution_profile: RuntimeExecutionProfile::V1_BUDGETED,
+    };
+
+    /// Contract v1.6 with atomic heterogeneous admission and ported cooperative execution.
+    pub const V1_6_PORTED_COOPERATIVE: Self = Self {
+        contract: RuntimeContract::V1_6,
+        execution_profile: RuntimeExecutionProfile::V1_PORTED_COOPERATIVE,
+    };
 }
 
 impl RuntimeContract {
@@ -354,6 +373,12 @@ impl RuntimeContract {
     pub const V1_5: Self = Self {
         version: RuntimeContractVersion::V1_5,
         capabilities: RuntimeCapabilities::V1_5_REQUIRED,
+    };
+
+    /// Runtime contract v1.6 with atomic heterogeneous task-group admission.
+    pub const V1_6: Self = Self {
+        version: RuntimeContractVersion::V1_6,
+        capabilities: RuntimeCapabilities::V1_6_REQUIRED,
     };
 
     /// Returns whether this backend satisfies `required`.

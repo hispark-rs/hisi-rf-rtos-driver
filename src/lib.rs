@@ -116,6 +116,174 @@ pub struct TaskResourceRequirements {
     stack_bytes_per_task: NonZeroUsize,
 }
 
+/// Maximum number of independently owned task groups admitted atomically.
+///
+/// This is a contract bound, not a chip task limit. A composition with more
+/// groups must aggregate adjacent owners before crossing the runtime boundary.
+pub const TASK_RESOURCE_GROUP_CAPACITY: usize = 4;
+
+/// Stable, runtime-opaque identity for one task-resource owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct TaskResourceOwner(NonZeroU32);
+
+impl TaskResourceOwner {
+    /// Construct an owner identity from a composition-defined non-zero value.
+    pub const fn new(raw: NonZeroU32) -> Self {
+        Self(raw)
+    }
+
+    /// Return the stable numeric identity used in diagnostics and reports.
+    pub const fn into_raw(self) -> NonZeroU32 {
+        self.0
+    }
+}
+
+/// One independently owned task group within an atomic resource plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskResourceGroupRequirements {
+    owner: TaskResourceOwner,
+    resources: TaskResourceRequirements,
+}
+
+impl TaskResourceGroupRequirements {
+    /// Bind one uniform-stack task group to its owner identity.
+    pub const fn new(owner: TaskResourceOwner, resources: TaskResourceRequirements) -> Self {
+        Self { owner, resources }
+    }
+
+    /// Owner receiving the resulting reservation token.
+    pub const fn owner(self) -> TaskResourceOwner {
+        self.owner
+    }
+
+    /// Slot and stack requirements for this group.
+    pub const fn resources(self) -> TaskResourceRequirements {
+        self.resources
+    }
+}
+
+/// Checked, heterogeneous task-resource plan admitted as one transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskResourcePlan<'a> {
+    groups: &'a [TaskResourceGroupRequirements],
+    total_task_slots: usize,
+    total_stack_bytes: usize,
+}
+
+impl<'a> TaskResourcePlan<'a> {
+    /// Validate group count, owner uniqueness, and checked totals.
+    pub const fn new(groups: &'a [TaskResourceGroupRequirements]) -> Option<Self> {
+        if groups.is_empty() || groups.len() > TASK_RESOURCE_GROUP_CAPACITY {
+            return None;
+        }
+        let mut total_task_slots = 0usize;
+        let mut total_stack_bytes = 0usize;
+        let mut index = 0usize;
+        while index < groups.len() {
+            let group = groups[index];
+            let mut previous = 0usize;
+            while previous < index {
+                if groups[previous].owner.into_raw().get() == group.owner.into_raw().get() {
+                    return None;
+                }
+                previous += 1;
+            }
+            total_task_slots =
+                match total_task_slots.checked_add(group.resources.task_slots().get()) {
+                    Some(value) => value,
+                    None => return None,
+                };
+            total_stack_bytes =
+                match total_stack_bytes.checked_add(group.resources.total_stack_bytes()) {
+                    Some(value) => value,
+                    None => return None,
+                };
+            index += 1;
+        }
+        Some(Self {
+            groups,
+            total_task_slots,
+            total_stack_bytes,
+        })
+    }
+
+    /// Ordered owner groups. Reservation results use this same order.
+    pub const fn groups(self) -> &'a [TaskResourceGroupRequirements] {
+        self.groups
+    }
+
+    /// Total dynamic slots derived from all child groups.
+    pub const fn total_task_slots(self) -> usize {
+        self.total_task_slots
+    }
+
+    /// Total task-stack payload derived from all child groups.
+    pub const fn total_stack_bytes(self) -> usize {
+        self.total_stack_bytes
+    }
+}
+
+/// Owner-bound reservations returned by one atomic resource-plan admission.
+#[derive(Debug)]
+#[must_use = "every reservation in the admitted batch must be retained or released"]
+pub struct TaskReservationBatch {
+    reservations: [Option<TaskReservation>; TASK_RESOURCE_GROUP_CAPACITY],
+    len: usize,
+}
+
+impl TaskReservationBatch {
+    /// Construct a batch from runtime-owned reservation identities.
+    ///
+    /// # Safety
+    ///
+    /// Every populated entry must be a distinct live reservation created by
+    /// the implementing runtime, and `len` must cover exactly those entries.
+    pub unsafe fn from_reservations(
+        reservations: [Option<TaskReservation>; TASK_RESOURCE_GROUP_CAPACITY],
+        len: usize,
+    ) -> Self {
+        debug_assert!(len <= TASK_RESOURCE_GROUP_CAPACITY);
+        debug_assert!(reservations[..len].iter().all(Option::is_some));
+        debug_assert!(reservations[len..].iter().all(Option::is_none));
+        Self { reservations, len }
+    }
+
+    /// Number of child reservations in plan order.
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the batch contains no child reservation.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Remove one child reservation by its plan-order index.
+    pub fn take(&mut self, index: usize) -> Option<TaskReservation> {
+        self.reservations.get_mut(index)?.take()
+    }
+
+    /// Number of reservations not yet removed from this batch.
+    pub fn remaining(&self) -> usize {
+        self.reservations[..self.len]
+            .iter()
+            .filter(|reservation| reservation.is_some())
+            .count()
+    }
+}
+
+impl Drop for TaskReservationBatch {
+    fn drop(&mut self) {
+        for reservation in self.reservations[..self.len]
+            .iter_mut()
+            .filter_map(Option::take)
+        {
+            let _ = release_task_reservation(&reservation);
+        }
+    }
+}
+
 impl TaskResourceRequirements {
     /// Construct a checked task-resource request.
     pub const fn new(task_slots: NonZeroUsize, stack_bytes_per_task: NonZeroUsize) -> Option<Self> {
@@ -166,6 +334,26 @@ pub enum TaskAdmissionError {
         required: usize,
         /// Bytes successfully reserved before allocation failed.
         available: usize,
+    },
+    /// One child group could not reserve all of its task slots.
+    InsufficientTaskGroupSlots {
+        /// Composition-defined owner of the failing group.
+        owner: TaskResourceOwner,
+        /// Slots required by this child group.
+        required: usize,
+        /// Slots available to the complete atomic transaction.
+        available: usize,
+    },
+    /// One child group could not reserve every requested stack.
+    InsufficientTaskGroupStackMemory {
+        /// Composition-defined owner of the failing group.
+        owner: TaskResourceOwner,
+        /// Stack bytes required by this child group.
+        required: usize,
+        /// Stack payload successfully allocated before rollback.
+        available: usize,
+        /// Largest payload allocation possible at the failure point.
+        largest_contiguous: usize,
     },
 }
 
@@ -396,6 +584,16 @@ pub trait Runtime: Sync {
         &self,
         _required: TaskResourceRequirements,
     ) -> Result<TaskReservation, TaskAdmissionError> {
+        Err(TaskAdmissionError::Runtime(Error::IncompatibleContract))
+    }
+
+    /// Atomically reserves every independently owned group in one plan.
+    ///
+    /// No reservation may remain live when this method returns an error.
+    fn reserve_task_resource_plan(
+        &self,
+        _plan: TaskResourcePlan<'_>,
+    ) -> Result<TaskReservationBatch, TaskAdmissionError> {
         Err(TaskAdmissionError::Runtime(Error::IncompatibleContract))
     }
 
@@ -632,6 +830,25 @@ pub fn reserve_task_resources(
             return Err(TaskAdmissionError::Runtime(Error::IncompatibleContract));
         }
         runtime.reserve_task_resources(required)
+    })
+}
+
+/// Atomically reserves all independently owned groups in `plan`.
+///
+/// Returned child reservations follow [`TaskResourcePlan::groups`] order. An
+/// error guarantees that the runtime rolled back every slot and stack.
+pub fn reserve_task_resource_plan(
+    plan: TaskResourcePlan<'_>,
+) -> Result<TaskReservationBatch, TaskAdmissionError> {
+    with_runtime_admission(|runtime| {
+        if !runtime
+            .contract()
+            .capabilities
+            .contains(RuntimeCapabilities::TASK_RESOURCE_PLAN_RESERVATION)
+        {
+            return Err(TaskAdmissionError::Runtime(Error::IncompatibleContract));
+        }
+        runtime.reserve_task_resource_plan(plan)
     })
 }
 
@@ -1205,5 +1422,54 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn heterogeneous_resource_plan_derives_totals_and_rejects_bad_shapes() {
+        let vendor = TaskResourceGroupRequirements::new(
+            TaskResourceOwner::new(NonZeroU32::new(1).unwrap()),
+            TaskResourceRequirements::new(
+                NonZeroUsize::new(7).unwrap(),
+                NonZeroUsize::new(24 * 1024).unwrap(),
+            )
+            .unwrap(),
+        );
+        let worker = TaskResourceGroupRequirements::new(
+            TaskResourceOwner::new(NonZeroU32::new(2).unwrap()),
+            TaskResourceRequirements::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(8 * 1024).unwrap(),
+            )
+            .unwrap(),
+        );
+        let groups = [vendor, worker];
+        let plan = TaskResourcePlan::new(&groups).unwrap();
+        assert_eq!(plan.total_task_slots(), 8);
+        assert_eq!(plan.total_stack_bytes(), 7 * 24 * 1024 + 8 * 1024);
+        assert_eq!(plan.groups(), &groups);
+
+        assert_eq!(TaskResourcePlan::new(&[]), None);
+        assert_eq!(TaskResourcePlan::new(&[vendor, vendor]), None);
+        assert_eq!(
+            TaskResourcePlan::new(&[vendor, worker, vendor, worker, vendor]),
+            None
+        );
+    }
+
+    #[test]
+    fn reservation_batch_transfers_each_child_once() {
+        let first = unsafe { TaskReservation::from_raw(NonZeroU32::new(0x101).unwrap()) };
+        let second = unsafe { TaskReservation::from_raw(NonZeroU32::new(0x102).unwrap()) };
+        let mut reservations = [const { None }; TASK_RESOURCE_GROUP_CAPACITY];
+        reservations[0] = Some(first);
+        reservations[1] = Some(second);
+        let mut batch = unsafe { TaskReservationBatch::from_reservations(reservations, 2) };
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch.remaining(), 2);
+        assert_eq!(batch.take(0).unwrap().into_raw().get(), 0x101);
+        assert_eq!(batch.remaining(), 1);
+        assert!(batch.take(0).is_none());
+        assert_eq!(batch.take(1).unwrap().into_raw().get(), 0x102);
+        assert_eq!(batch.remaining(), 0);
     }
 }
